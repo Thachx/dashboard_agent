@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "power-bi-dashboard-agent"
+version = "0.1.0"
+description = "LangGraph agent over JSON datasets in S3 with Power BI chat embeds"
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.34.0",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langgraph>=0.2.60",
+  "langgraph-cli[inmem]>=0.4.0",
+  "networkx>=3.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

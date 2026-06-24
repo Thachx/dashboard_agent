@@ -1,0 +1,11 @@
+.env
+.env.local
+**/.env
+**/.env.local
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+backend/data/
+backend/src/*.egg-info/
+agent-chat-ui/.next/
+agent-chat-ui/node_modules/
