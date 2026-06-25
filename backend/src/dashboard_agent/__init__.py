@@ -1,1 +1,1 @@
-"""Power BI dashboard agent."""
+"""Dashboard graph agent."""

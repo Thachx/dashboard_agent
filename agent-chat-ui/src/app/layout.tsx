@@ -11,8 +11,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Power BI Dashboard Agent",
-  description: "Chat with S3 JSON data and embedded Power BI reports",
+  title: "Dashboard Graph Agent",
+  description: "Chat with S3 JSON data and graph dashboard widgets",
 };
 
 export default function RootLayout({

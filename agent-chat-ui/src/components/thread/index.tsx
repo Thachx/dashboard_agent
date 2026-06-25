@@ -468,6 +468,7 @@ export function Thread() {
         thread_id: newThreadId,
         created_at: nowIso,
         updated_at: nowIso,
+        state_updated_at: nowIso,
         metadata: threadMetadata,
         status: "busy",
         values: { messages: [newHumanMessage] },
@@ -694,7 +695,7 @@ export function Thread() {
                   }}
                 >
                   <span className="text-xl font-semibold tracking-tight">
-                    Power BI Dashboard Agent
+                    Dashboard Graph Agent
                   </span>
                 </motion.button>
               </div>

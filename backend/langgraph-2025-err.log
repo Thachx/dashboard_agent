@@ -1,0 +1,19 @@
+INFO:langgraph_api.cli:
+
+        Welcome to
+
+╦  ┌─┐┌┐┌┌─┐╔═╗┬─┐┌─┐┌─┐┬ ┬
+║  ├─┤││││ ┬║ ╦├┬┘├─┤├─┘├─┤
+╩═╝┴ ┴┘└┘└─┘╚═╝┴└─┴ ┴┴  ┴ ┴
+
+- 🚀 API: [36mhttp://127.0.0.1:2025[0m
+- 🎨 Studio UI: [36mhttps://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2025[0m
+- 📚 API Docs: [36mhttp://127.0.0.1:2025/docs[0m
+
+This in-memory server is designed for development and testing.
+For production use, please use LangSmith Deployment.
+
+
+Server started in 5.22s
+🎨 Opening Studio in your browser...
+URL: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2025

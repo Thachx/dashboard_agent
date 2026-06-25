@@ -22,14 +22,14 @@ import {
   type SpreadsheetAnalysisVisualPayload,
 } from "./spreadsheet-analysis-visual";
 import {
-  PowerBiDashboard,
-  type PowerBiDashboardPayload,
-} from "./power-bi-dashboard";
+  PowerBiWidget,
+  type GraphDashboardWidgetPayload,
+} from "./power-bi-widget";
 
 const SPREADSHEET_ANALYSIS_VISUAL_REGEX =
   /\n*<<<SPREADSHEET_ANALYSIS_VISUAL>>>\s*([\s\S]*?)\s*<<<END_SPREADSHEET_ANALYSIS_VISUAL>>>\s*/i;
-const POWER_BI_DASHBOARD_REGEX =
-  /\n*<<<POWER_BI_DASHBOARD>>>\s*([\s\S]*?)\s*<<<END_POWER_BI_DASHBOARD>>>\s*/i;
+const GRAPH_DASHBOARD_WIDGET_REGEX =
+  /\n*<<<GRAPH_DASHBOARD_WIDGET>>>\s*([\s\S]*?)\s*<<<END_GRAPH_DASHBOARD_WIDGET>>>\s*/i;
 
 function parseTimestamp(value: unknown): number | null {
   if (typeof value !== "string" || !value) return null;
@@ -67,7 +67,7 @@ function CustomComponent({
       {customComponents.map((customComponent) => (
         <LoadExternalComponent
           key={customComponent.id}
-          stream={thread}
+          stream={thread as any}
           message={customComponent}
           meta={{ ui: customComponent, artifact }}
         />
@@ -215,22 +215,22 @@ function extractSpreadsheetAnalysisVisual(
   return { visibleText, visual: null };
 }
 
-function extractPowerBiDashboard(
+function extractGraphDashboardWidget(
   text: string,
-): { visibleText: string; dashboard: PowerBiDashboardPayload | null } {
-  if (!text) return { visibleText: "", dashboard: null };
-  const match = text.match(POWER_BI_DASHBOARD_REGEX);
-  if (!match) return { visibleText: text, dashboard: null };
-  const visibleText = text.replace(POWER_BI_DASHBOARD_REGEX, "\n\n").trim();
+): { visibleText: string; widget: GraphDashboardWidgetPayload | null } {
+  if (!text) return { visibleText: "", widget: null };
+  const match = text.match(GRAPH_DASHBOARD_WIDGET_REGEX);
+  if (!match) return { visibleText: text, widget: null };
+  const visibleText = text.replace(GRAPH_DASHBOARD_WIDGET_REGEX, "\n\n").trim();
   try {
-    const parsed = JSON.parse(match[1]) as PowerBiDashboardPayload;
-    if (parsed?.kind === "power-bi-dashboard" && parsed.embedUrl) {
-      return { visibleText, dashboard: parsed };
+    const parsed = JSON.parse(match[1]) as GraphDashboardWidgetPayload;
+    if (parsed?.kind === "graph-dashboard-widget") {
+      return { visibleText, widget: parsed };
     }
   } catch {
     // Ignore malformed hidden payloads and keep the text response.
   }
-  return { visibleText, dashboard: null };
+  return { visibleText, widget: null };
 }
 
 export function AssistantMessage({
@@ -247,8 +247,8 @@ export function AssistantMessage({
   const content = message?.content ?? [];
   const rawContentString = getContentString(content);
   const { thinking, rest } = separateThinking(rawContentString);
-  const { visibleText: withoutDashboard, dashboard: powerBiDashboard } =
-    useMemo(() => extractPowerBiDashboard(rest), [rest]);
+  const { visibleText: withoutDashboard, widget: graphDashboardWidget } =
+    useMemo(() => extractGraphDashboardWidget(rest), [rest]);
   const { visibleText: contentString, visual: spreadsheetVisual } =
     useMemo(
       () => extractSpreadsheetAnalysisVisual(withoutDashboard),
@@ -554,8 +554,8 @@ export function AssistantMessage({
             {spreadsheetVisual && (
               <SpreadsheetAnalysisVisual payload={spreadsheetVisual} />
             )}
-            {powerBiDashboard && (
-              <PowerBiDashboard payload={powerBiDashboard} />
+            {graphDashboardWidget && (
+              <PowerBiWidget payload={graphDashboardWidget} />
             )}
 
             {!hideToolCalls && !hasDetailsPanel && !isLoading && (
