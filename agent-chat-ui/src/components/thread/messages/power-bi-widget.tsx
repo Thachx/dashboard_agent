@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  BarChart3,
   BookOpen,
   Clock,
   Database,
@@ -58,23 +59,45 @@ type ActivityRecord = {
   [key: string]: unknown;
 };
 
+type ActivityDatasetMeta = {
+  source?: string;
+  s3_uri?: string;
+  bucket?: string;
+  key?: string;
+  object_type?: string;
+  size_bytes?: number | string;
+  last_modified?: string;
+  sample_record_count?: number;
+  content_sample_ranges?: number;
+  content_sample_bytes?: number | string;
+  sample_fields?: unknown;
+  totalRecords?: number | string;
+  sampleRecords?: number;
+  isFullAggregate?: boolean;
+  distinctEvents?: number;
+  distinctCourses?: number;
+  distinctUsers?: number;
+};
+
+type ChartSlot = {
+  id: string;
+  title: string;
+  chartType: string;
+  field: string;
+  reason?: string;
+  data: ChartDatum[];
+};
+
+type LayoutBlock =
+  | { type: "metric"; id: string; span?: number }
+  | { type: "chart"; slotId: string; span?: number }
+  | { type: "source"; span?: number }
+  | { type: "records"; span?: number };
+
 type ActivityDashboardPayload = {
-  datasets?: Record<
-    string,
-    {
-      s3_uri?: string;
-      bucket?: string;
-      key?: string;
-      object_type?: string;
-      size_bytes?: number | string;
-      last_modified?: string;
-      sample_record_count?: number;
-      content_sample_ranges?: number;
-      content_sample_bytes?: number | string;
-      sample_fields?: unknown;
-    }
-  >;
+  datasets?: Record<string, ActivityDatasetMeta> | ActivityDatasetMeta[];
   summary?: {
+    source?: string;
     sampleRecords?: number;
     totalRecords?: number | string;
     isFullAggregate?: boolean;
@@ -96,14 +119,12 @@ type ActivityDashboardPayload = {
     field: string;
     reason?: string;
   }>;
-  chartSlots?: Array<{
-    id: string;
-    title: string;
-    chartType: string;
-    field: string;
-    reason?: string;
-    data: ChartDatum[];
-  }>;
+  chartSlots?: ChartSlot[];
+  layoutSpec?: {
+    title?: string;
+    subtitle?: string;
+    blocks?: LayoutBlock[];
+  };
   records?: ActivityRecord[];
 };
 
@@ -477,6 +498,182 @@ function DashboardBarChart({
   );
 }
 
+function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayload }) {
+  const layoutSpec = activity?.layoutSpec;
+  if (!layoutSpec?.blocks?.length) {
+    return <ActivityDashboardSection activity={activity} />;
+  }
+
+  const records = activity?.records ?? [];
+  const charts = activity?.charts ?? {};
+  const chartSlots =
+    activity?.chartSlots ??
+    Object.entries(charts)
+      .filter(([, data]) => Array.isArray(data))
+      .map(([id, data]) => ({
+        id,
+        title: id,
+        chartType: id === "timeline" || id === "activityTimeline" ? "line" : "bar",
+        field: id,
+        data: data as ChartDatum[],
+      }));
+  const slotById = new Map(chartSlots.map((slot) => [slot.id, slot]));
+  const datasetValues = Array.isArray(activity?.datasets)
+    ? activity.datasets
+    : Object.values(activity?.datasets ?? {});
+  const sourceMeta = datasetValues[0];
+  const summary = activity?.summary ?? {};
+  const sourceName = summary.source ?? sourceMeta?.source ?? sourceMeta?.s3_uri ?? "Matched activity data";
+  const metricDefs: Record<
+    string,
+    { label: string; value: number | string | undefined; hint: string; icon: typeof Activity }
+  > = {
+    totalRecords: {
+      label: "Activity rows",
+      value: summary.totalRecords ?? sourceMeta?.totalRecords ?? summary.sampleRecords ?? records.length,
+      hint: summary.isFullAggregate ? "Full aggregate" : "Matched sample",
+      icon: Activity,
+    },
+    sampleRecords: {
+      label: "Sample rows",
+      value: summary.sampleRecords ?? records.length,
+      hint: "Rows available in the widget",
+      icon: Database,
+    },
+    distinctEvents: {
+      label: "Event types",
+      value: summary.distinctEvents ?? charts.events?.length,
+      hint: "Distinct event values",
+      icon: BarChart3,
+    },
+    distinctCourses: {
+      label: "Courses",
+      value: summary.distinctCourses ?? charts.courses?.length,
+      hint: "Distinct course values",
+      icon: BookOpen,
+    },
+    distinctUsers: {
+      label: "Users",
+      value: summary.distinctUsers,
+      hint: "Distinct user values",
+      icon: Users,
+    },
+  };
+
+  const renderSource = (span?: number) => (
+    <div
+      key="source"
+      className={`grid gap-3 ${span === 2 ? "lg:col-span-2 lg:grid-cols-3" : ""}`}
+    >
+      <div className="rounded-lg bg-muted/10 p-3">
+        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <Database className="h-4 w-4" aria-hidden="true" />
+          Source
+        </div>
+        <p className="mt-2 break-words text-sm font-medium">{sourceName}</p>
+      </div>
+      <div className="rounded-lg bg-muted/10 p-3">
+        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <Clock className="h-4 w-4" aria-hidden="true" />
+          Updated
+        </div>
+        <p className="mt-2 text-sm font-medium">
+          {formatDateTime(sourceMeta?.last_modified ?? "") || "Not provided"}
+        </p>
+      </div>
+      <div className="rounded-lg bg-muted/10 p-3">
+        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <Activity className="h-4 w-4" aria-hidden="true" />
+          Coverage
+        </div>
+        <p className="mt-2 text-sm font-medium">
+          {summary.isFullAggregate ? "Full aggregate" : "Sampled records"}
+        </p>
+      </div>
+    </div>
+  );
+
+  const renderRecords = () => {
+    if (!records.length) return null;
+    return (
+      <div key="records" className="overflow-x-auto rounded-lg bg-muted/10">
+        <table className="min-w-[760px] text-left text-xs">
+          <thead className="bg-muted/30 text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 font-medium">Time</th>
+              <th className="px-3 py-2 font-medium">Event</th>
+              <th className="px-3 py-2 font-medium">Course</th>
+              <th className="px-3 py-2 font-medium">User</th>
+              <th className="px-3 py-2 font-medium">Context</th>
+            </tr>
+          </thead>
+          <tbody>
+            {records.slice(0, 8).map((record, index) => (
+              <tr key={`${record.timestamp ?? record["@timestamp"] ?? index}`} className="border-t border-border">
+                <td className="px-3 py-2">{formatDateTime(record["@timestamp"] ?? record.timestamp)}</td>
+                <td className="px-3 py-2">{String(record.event ?? record.event_type ?? "Activity")}</td>
+                <td className="px-3 py-2">{courseName(record.courseID)}</td>
+                <td className="px-3 py-2">{shortId(record.userID, 8)}</td>
+                <td className="max-w-[260px] px-3 py-2">
+                  {String(record.eventCategory ?? record.appID ?? record.source_file ?? "").slice(0, 80)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  return (
+    <section className="mt-3 overflow-hidden rounded-xl border border-border bg-background shadow-sm">
+      <div className="border-b border-border p-4">
+        <div className="flex flex-col gap-1">
+          <h3 className="text-base font-semibold">{layoutSpec.title ?? "Activity dashboard"}</h3>
+          {layoutSpec.subtitle ? (
+            <p className="max-w-3xl text-sm text-muted-foreground">{layoutSpec.subtitle}</p>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="grid gap-3 p-4 md:grid-cols-2 lg:grid-cols-4">
+        {layoutSpec.blocks.map((block, index) => {
+          if (block.type === "metric") {
+            const metric = metricDefs[block.id];
+            if (!metric || metric.value == null) return null;
+            return (
+              <div key={`${block.type}-${block.id}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>
+                <MetricCard
+                  label={metric.label}
+                  value={metric.value}
+                  hint={metric.hint}
+                  icon={metric.icon}
+                />
+              </div>
+            );
+          }
+          if (block.type === "chart") {
+            const slot = slotById.get(block.slotId);
+            if (!slot?.data?.length) return null;
+            return (
+              <div key={`${block.type}-${block.slotId}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>
+                <ChartSlotCard slot={slot} />
+              </div>
+            );
+          }
+          if (block.type === "source") {
+            return <div key={`${block.type}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>{renderSource(block.span)}</div>;
+          }
+          if (block.type === "records") {
+            return <div key={`${block.type}-${index}`} className="md:col-span-2 lg:col-span-4">{renderRecords()}</div>;
+          }
+          return null;
+        })}
+      </div>
+    </section>
+  );
+}
+
 function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPayload }) {
   const records = activity?.records ?? [];
   const charts = activity?.charts ?? {};
@@ -717,7 +914,7 @@ export function PowerBiWidget({
         </p>
       </header>
 
-      <ActivityDashboardSection activity={activity} />
+      <PromptDashboardSection activity={activity} />
 
       {!hasActivityDashboard ? (
         <>
