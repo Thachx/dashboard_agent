@@ -91,6 +91,10 @@ class JsonGraphStore:
                 size=source.size,
                 text=f"S3 {source.object_type} dataset {source.key}",
             )
+            if source.object_type == "duckdb_aggregate":
+                graph.nodes[root_id]["type"] = "aggregate"
+                graph.nodes[root_id]["value"] = source.value
+                graph.nodes[root_id]["text"] = f"DuckDB aggregate {source.key} {self._preview(source.value, 4000)}"
             self._add_value(graph, root_id, source.value, path="$", source_key=source.key)
 
         self.updated_at = time.time()

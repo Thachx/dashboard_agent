@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from dashboard_agent.graph_store import JsonGraphStore
+from dashboard_agent.duckdb_ingest import ingest_duckdb_database
 from dashboard_agent.graphify_ingest import ingest_s3_with_graphify
 from dashboard_agent.s3_source import S3JsonSource
 
@@ -29,6 +30,7 @@ DEFAULT_ENV_PATHS = (ROOT / ".env", ROOT.parent / "agent-chat-ui" / ".env")
 DEFAULT_GRAPH_PATH = ROOT / "data" / "s3-json-graph.json"
 DEFAULT_GRAPHIFY_OUTPUT = ROOT / "data" / "graphify-out"
 DEFAULT_AGGREGATE_CACHE = ROOT / "data" / "full-scan-aggregates.json"
+DEFAULT_DUCKDB_PATH = ROOT.parent / "data" / "_warehouse" / "dashboard_agent.duckdb"
 DEFAULT_S3_URI = "s3://edx-nectec-demo"
 AGGREGATE_FIELDS = (
     "full_scan_status",
@@ -68,6 +70,12 @@ def parse_args() -> argparse.Namespace:
             "Already scanned unchanged objects are reused from the graph."
         )
     )
+    parser.add_argument(
+        "--source",
+        choices=("s3", "duckdb"),
+        default=os.getenv("FULL_INGEST_SOURCE", "s3"),
+        help="Ingest source backend: s3 or duckdb.",
+    )
     parser.add_argument("--s3-uri", help="S3 URI to scan. Defaults to S3_DATA_URI/.env or s3://edx-nectec-demo.")
     parser.add_argument(
         "--activity-key",
@@ -78,6 +86,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--graph-path", default=str(DEFAULT_GRAPH_PATH), help="Output graph JSON path.")
+    parser.add_argument("--duckdb-path", default=str(DEFAULT_DUCKDB_PATH), help="DuckDB database path when --source duckdb.")
+    parser.add_argument("--duckdb-table", default="unified_records", help="DuckDB table to ingest when --source duckdb.")
+    parser.add_argument("--duckdb-sample-records", type=int, default=3, help="Sample records per DuckDB source file/table.")
+    parser.add_argument("--duckdb-max-sources", type=int, default=None, help="Optional limit on DuckDB sources for testing.")
     parser.add_argument("--graphify-output", default=str(DEFAULT_GRAPHIFY_OUTPUT), help="Graphify output directory.")
     parser.add_argument(
         "--aggregate-cache",
@@ -102,8 +114,24 @@ def main() -> int:
         load_env_file(env_path)
 
     args = parse_args()
-    s3_uri = args.s3_uri or os.getenv("S3_DATA_URI") or DEFAULT_S3_URI
     graph_path = Path(args.graph_path)
+    if args.source == "duckdb":
+        started = time.monotonic()
+        graph_path.parent.mkdir(parents=True, exist_ok=True)
+        store = JsonGraphStore(graph_path, load_existing=False)
+        status = ingest_duckdb_database(
+            store,
+            Path(args.duckdb_path),
+            table=args.duckdb_table,
+            sample_records_per_source=args.duckdb_sample_records,
+            max_sources=args.duckdb_max_sources,
+        )
+        elapsed = time.monotonic() - started
+        print(json.dumps(status, indent=2, ensure_ascii=False), flush=True)
+        print(f"duckdb ingest finished in {elapsed:,.1f}s", flush=True)
+        return 0
+
+    s3_uri = args.s3_uri or os.getenv("S3_DATA_URI") or DEFAULT_S3_URI
     aggregate_cache = Path(args.aggregate_cache)
     key_filter = args.activity_key.strip()
 
@@ -116,6 +144,10 @@ def main() -> int:
     existing_aggregates: dict[str, dict[str, Any]] = {}
     incremental_seeds: dict[str, dict[str, Any]] = {}
     if not args.force_rescan:
+        print(
+            f"planning full scan for {s3_uri}: checking reusable aggregate cache...",
+            flush=True,
+        )
         existing_aggregates, incremental_seeds = _existing_aggregate_plan(
             graph_path,
             aggregate_cache,
@@ -209,9 +241,12 @@ def _existing_aggregate_plan(
     if not states:
         return {}, {}
 
+    print(f"validating {len(states):,} cached aggregate object state(s) against S3...", flush=True)
+    started = time.monotonic()
+    last_progress = started
     unchanged: dict[str, dict[str, Any]] = {}
     incremental: dict[str, dict[str, Any]] = {}
-    for key, state in states.items():
+    for index, (key, state) in enumerate(states.items(), start=1):
         current_state = _current_s3_object_state(source, key)
         if current_state is None:
             continue
@@ -219,6 +254,14 @@ def _existing_aggregate_plan(
             unchanged[key] = {field: state[field] for field in _reusable_aggregate_fields(state)}
         elif _can_incremental_update(state, current_state):
             incremental[key] = dict(state)
+        now = time.monotonic()
+        if now - last_progress >= 5 or index == len(states):
+            print(
+                "aggregate cache validation progress "
+                f"{index:,}/{len(states):,}; reuse {len(unchanged):,}, incremental {len(incremental):,}",
+                flush=True,
+            )
+            last_progress = now
 
     return unchanged, incremental
 

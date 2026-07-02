@@ -38,10 +38,11 @@ export function ThreadProvider({ children }: { children: ReactNode }) {
   const [apiUrl] = useQueryState("apiUrl");
   const [assistantId] = useQueryState("assistantId");
   const defaultApiUrl = "/api";
+  const defaultAssistantId = "dashboard_agent";
   const envAssistantId: string | undefined =
     process.env.NEXT_PUBLIC_ASSISTANT_ID;
   const finalApiUrl = apiUrl || defaultApiUrl;
-  const finalAssistantId = assistantId || envAssistantId;
+  const finalAssistantId = assistantId || envAssistantId || defaultAssistantId;
   const [threads, setThreads] = useState<Thread[]>([]);
   const [threadsLoading, setThreadsLoading] = useState(false);
 

@@ -278,9 +278,9 @@ function MetricCard({
   icon: typeof Activity;
 }) {
   return (
-    <div className="rounded-lg border bg-background p-3 shadow-sm">
+    <div className="min-w-0 rounded-lg border bg-background p-3 shadow-sm">
       <div className="flex items-start justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <p className="text-xs text-muted-foreground">{label}</p>
           <p className="mt-1 text-2xl font-semibold">{formatNumber(value)}</p>
         </div>
@@ -379,23 +379,23 @@ function MiniColumnChart({ data, title }: { data: ChartDatum[]; title: string })
 }
 
 function TimelineChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
-  const chartData = data.slice(0, 12).map((item) => ({
+  const chartData = data.map((item) => ({
     label: item.label,
     value: Number(item.value ?? item.score ?? 0),
   }));
   if (!chartData.length) return null;
 
   return (
-    <div className="rounded-lg border bg-muted/10 p-3 lg:col-span-2">
+    <div className="min-w-0 rounded-lg border bg-muted/10 p-3">
       <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </p>
-      <div className="mt-3 h-44">
+      <div className="mt-3 h-56">
         <ResponsiveContainer width="100%" height="100%">
-          <LineChart data={chartData} margin={{ top: 8, right: 16, bottom: 0, left: -24 }}>
+          <LineChart data={chartData} margin={{ top: 8, right: 12, bottom: 8, left: -8 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="label" tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 10 }} minTickGap={24} />
+            <YAxis tick={{ fontSize: 10 }} tickFormatter={formatNumber} allowDecimals={false} width={42} />
             <Tooltip formatter={(value) => formatNumber(value)} />
             <Line
               type="monotone"
@@ -523,7 +523,6 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     : Object.values(activity?.datasets ?? {});
   const sourceMeta = datasetValues[0];
   const summary = activity?.summary ?? {};
-  const sourceName = summary.source ?? sourceMeta?.source ?? sourceMeta?.s3_uri ?? "Matched activity data";
   const metricDefs: Record<
     string,
     { label: string; value: number | string | undefined; hint: string; icon: typeof Activity }
@@ -558,40 +557,25 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
       hint: "Distinct user values",
       icon: Users,
     },
+    distinctDimensionValues: {
+      label: `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
+      value: (summary as Record<string, unknown>).distinctDimensionValues as number | string | undefined,
+      hint: "Distinct ranked dimension values",
+      icon: Database,
+    },
+    totalDistinctMeasure: {
+      label: `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+      value: (summary as Record<string, unknown>).totalDistinctMeasure as number | string | undefined,
+      hint: "Distinct values included in the aggregate",
+      icon: Users,
+    },
+    topDimensionValue: {
+      label: `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+      value: (summary as Record<string, unknown>).topDimensionValue as number | string | undefined,
+      hint: formatValue((summary as Record<string, unknown>).topDimensionLabel, "Top value"),
+      icon: Users,
+    },
   };
-
-  const renderSource = (span?: number) => (
-    <div
-      key="source"
-      className={`grid gap-3 ${span === 2 ? "lg:col-span-2 lg:grid-cols-3" : ""}`}
-    >
-      <div className="rounded-lg bg-muted/10 p-3">
-        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <Database className="h-4 w-4" aria-hidden="true" />
-          Source
-        </div>
-        <p className="mt-2 break-words text-sm font-medium">{sourceName}</p>
-      </div>
-      <div className="rounded-lg bg-muted/10 p-3">
-        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <Clock className="h-4 w-4" aria-hidden="true" />
-          Updated
-        </div>
-        <p className="mt-2 text-sm font-medium">
-          {formatDateTime(sourceMeta?.last_modified ?? "") || "Not provided"}
-        </p>
-      </div>
-      <div className="rounded-lg bg-muted/10 p-3">
-        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          <Activity className="h-4 w-4" aria-hidden="true" />
-          Coverage
-        </div>
-        <p className="mt-2 text-sm font-medium">
-          {summary.isFullAggregate ? "Full aggregate" : "Sampled records"}
-        </p>
-      </div>
-    </div>
-  );
 
   const renderRecords = () => {
     if (!records.length) return null;
@@ -624,9 +608,12 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
       </div>
     );
   };
+  const metricBlocks = layoutSpec.blocks.filter((block) => block.type === "metric");
+  const chartBlocks = layoutSpec.blocks.filter((block) => block.type === "chart");
+  const recordBlocks = layoutSpec.blocks.filter((block) => block.type === "records");
 
   return (
-    <section className="mt-3 overflow-hidden rounded-xl border border-border bg-background shadow-sm">
+    <section className="overflow-hidden bg-background">
       <div className="border-b border-border p-4">
         <div className="flex flex-col gap-1">
           <h3 className="text-base font-semibold">{layoutSpec.title ?? "Activity dashboard"}</h3>
@@ -636,13 +623,14 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
         </div>
       </div>
 
-      <div className="grid gap-3 p-4 md:grid-cols-2 lg:grid-cols-4">
-        {layoutSpec.blocks.map((block, index) => {
+      <div className="grid gap-3 p-4 lg:grid-cols-[minmax(180px,0.8fr)_minmax(360px,2.2fr)]">
+        <div className="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-1">
+          {metricBlocks.map((block, index) => {
           if (block.type === "metric") {
             const metric = metricDefs[block.id];
             if (!metric || metric.value == null) return null;
             return (
-              <div key={`${block.type}-${block.id}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>
+              <div key={`${block.type}-${block.id}-${index}`} className="min-w-0">
                 <MetricCard
                   label={metric.label}
                   value={metric.value}
@@ -652,20 +640,26 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
               </div>
             );
           }
+          return null;
+        })}
+        </div>
+        <div className="min-w-0">
+          {chartBlocks.map((block, index) => {
           if (block.type === "chart") {
             const slot = slotById.get(block.slotId);
             if (!slot?.data?.length) return null;
             return (
-              <div key={`${block.type}-${block.slotId}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>
+              <div key={`${block.type}-${block.slotId}-${index}`} className="min-w-0">
                 <ChartSlotCard slot={slot} />
               </div>
             );
           }
-          if (block.type === "source") {
-            return <div key={`${block.type}-${index}`} className={block.span === 2 ? "lg:col-span-2" : ""}>{renderSource(block.span)}</div>;
-          }
+          return null;
+        })}
+        </div>
+        {recordBlocks.map((block, index) => {
           if (block.type === "records") {
-            return <div key={`${block.type}-${index}`} className="md:col-span-2 lg:col-span-4">{renderRecords()}</div>;
+            return <div key={`${block.type}-${index}`} className="min-w-0 lg:col-span-2">{renderRecords()}</div>;
           }
           return null;
         })}
@@ -907,12 +901,14 @@ export function PowerBiWidget({
 
   return (
     <section className="mt-3 overflow-hidden rounded-xl border border-border bg-background shadow-sm">
-      <header className="border-b border-border bg-[#f3f2f1] px-4 py-3">
-        <p className="text-sm font-semibold">{payload.title}</p>
-        <p className="text-xs text-muted-foreground">
-          Activity dashboard backed by retrieved S3 graph context
-        </p>
-      </header>
+      {!hasActivityDashboard ? (
+        <header className="border-b border-border bg-[#f3f2f1] px-4 py-3">
+          <p className="text-sm font-semibold">{payload.title}</p>
+          <p className="text-xs text-muted-foreground">
+            Dashboard backed by retrieved graph context
+          </p>
+        </header>
+      ) : null}
 
       <PromptDashboardSection activity={activity} />
 
@@ -942,73 +938,75 @@ export function PowerBiWidget({
         </>
       ) : null}
 
-      <div className="border-t border-border px-4 py-3">
-        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          Data source
-        </p>
-        {datasets.length ? (
-          <div className="mt-3 grid gap-3">
-            {datasets.map((dataset) => (
-              <article key={dataset.key} className="rounded-lg border bg-muted/10 p-3">
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p className="break-words text-sm font-semibold">
-                      {dataset.label ? dataset.label.replace(/[-_]/g, " ") : dataset.key}
-                    </p>
-                    <p className="mt-1 break-words text-xs text-muted-foreground">
-                      {dataset.s3Uri ?? dataset.key}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 gap-2 text-xs">
-                    {dataset.objectType ? (
-                      <span className="rounded border bg-background px-2 py-1 font-medium uppercase">
-                        {dataset.objectType}
-                      </span>
-                    ) : null}
-                    {dataset.sizeBytes !== undefined ? (
-                      <span className="rounded border bg-background px-2 py-1 font-medium">
-                        {formatBytes(dataset.sizeBytes)}
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-                <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-                  {dataset.bucket ? (
-                    <div>
-                      <dt className="text-muted-foreground">Bucket</dt>
-                      <dd className="break-words font-medium">{dataset.bucket}</dd>
-                    </div>
-                  ) : null}
-                  {dataset.lastModified ? (
-                    <div>
-                      <dt className="text-muted-foreground">Last modified</dt>
-                      <dd className="break-words font-medium">{dataset.lastModified}</dd>
-                    </div>
-                  ) : null}
-                  {dataset.etag ? (
-                    <div>
-                      <dt className="text-muted-foreground">ETag</dt>
-                      <dd className="break-words font-medium">{dataset.etag}</dd>
-                    </div>
-                  ) : null}
-                  {dataset.matchedFields?.length ? (
-                    <div>
-                      <dt className="text-muted-foreground">Fields used in this view</dt>
-                      <dd className="break-words font-medium">
-                        {dataset.matchedFields.slice(0, 6).join(", ")}
-                      </dd>
-                    </div>
-                  ) : null}
-                </dl>
-              </article>
-            ))}
-          </div>
-        ) : (
-          <p className="mt-2 text-sm text-muted-foreground">
-            No dataset metadata was found for this request.
+      {!hasActivityDashboard ? (
+        <div className="border-t border-border px-4 py-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Data source
           </p>
-        )}
-      </div>
+          {datasets.length ? (
+            <div className="mt-3 grid gap-3">
+              {datasets.map((dataset) => (
+                <article key={dataset.key} className="rounded-lg border bg-muted/10 p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="break-words text-sm font-semibold">
+                        {dataset.label ? dataset.label.replace(/[-_]/g, " ") : dataset.key}
+                      </p>
+                      <p className="mt-1 break-words text-xs text-muted-foreground">
+                        {dataset.s3Uri ?? dataset.key}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-2 text-xs">
+                      {dataset.objectType ? (
+                        <span className="rounded border bg-background px-2 py-1 font-medium uppercase">
+                          {dataset.objectType}
+                        </span>
+                      ) : null}
+                      {dataset.sizeBytes !== undefined ? (
+                        <span className="rounded border bg-background px-2 py-1 font-medium">
+                          {formatBytes(dataset.sizeBytes)}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                  <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                    {dataset.bucket ? (
+                      <div>
+                        <dt className="text-muted-foreground">Bucket</dt>
+                        <dd className="break-words font-medium">{dataset.bucket}</dd>
+                      </div>
+                    ) : null}
+                    {dataset.lastModified ? (
+                      <div>
+                        <dt className="text-muted-foreground">Last modified</dt>
+                        <dd className="break-words font-medium">{dataset.lastModified}</dd>
+                      </div>
+                    ) : null}
+                    {dataset.etag ? (
+                      <div>
+                        <dt className="text-muted-foreground">ETag</dt>
+                        <dd className="break-words font-medium">{dataset.etag}</dd>
+                      </div>
+                    ) : null}
+                    {dataset.matchedFields?.length ? (
+                      <div>
+                        <dt className="text-muted-foreground">Fields used in this view</dt>
+                        <dd className="break-words font-medium">
+                          {dataset.matchedFields.slice(0, 6).join(", ")}
+                        </dd>
+                      </div>
+                    ) : null}
+                  </dl>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-2 text-sm text-muted-foreground">
+              No dataset metadata was found for this request.
+            </p>
+          )}
+        </div>
+      ) : null}
 
       {!hasActivityDashboard ? (
         <div className="border-t border-border px-4 py-3">

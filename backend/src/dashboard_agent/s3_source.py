@@ -73,10 +73,21 @@ class S3JsonSource:
 
         client = boto3.client("s3", region_name=self.region)
         paginator = client.get_paginator("list_objects_v2")
+        listed_pages = 0
+        listed_objects = 0
+        yielded_objects = 0
+        listed_bytes = 0
+        started_at = time.monotonic()
+        last_listing_progress_at = started_at
+        print(f"S3 listing started s3://{self.bucket}/{self.prefix}", file=sys.stderr, flush=True)
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
-            for item in page.get("Contents", []):
+            listed_pages += 1
+            page_items = page.get("Contents", [])
+            listed_objects += len(page_items)
+            for item in page_items:
                 key = str(item["Key"])
                 size = int(item.get("Size", 0))
+                listed_bytes += size
                 extension = _object_extension(key)
                 if extension not in self.include_extensions:
                     continue
@@ -116,6 +127,16 @@ class S3JsonSource:
                                     seed_value=seed_value,
                                 )
                             )
+                    yielded_objects += 1
+                    now = time.monotonic()
+                    if now - last_listing_progress_at >= max(1.0, aggregate_progress_seconds):
+                        print(
+                            "S3 listing progress %s page(s), %s object(s) seen, %s candidate(s), %.1f MB listed"
+                            % (listed_pages, listed_objects, yielded_objects, listed_bytes / 1024 / 1024),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        last_listing_progress_at = now
                     yield JsonObject(
                         key=key,
                         etag=etag,
@@ -347,6 +368,7 @@ def _aggregate_json_lines_content_resumable(
     progress_seconds: float,
     seed_value: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    print(f"full scan preparing s3://{bucket}/{key} ({object_size:,} listed bytes)", file=sys.stderr, flush=True)
     head = _safe_head_object(client, bucket, key)
     etag = str(head.get("ETag") or "").strip('"')
     size = int(head.get("ContentLength") or object_size or 0)
@@ -493,6 +515,7 @@ def _aggregate_json_object_stream_content_resumable(
 
     counts = checkpoint["counts"]
     time_buckets = checkpoint["time_buckets"]
+    distinct_time_buckets = checkpoint.get("distinct_time_buckets", {})
     record_count = int(checkpoint["record_count"])
     next_start = int(checkpoint["next_start"])
     tail = bytes.fromhex(str(checkpoint.get("tail_hex") or ""))
@@ -537,10 +560,11 @@ def _aggregate_json_object_stream_content_resumable(
             size=size,
             next_start=next_start,
             tail=tail,
-            record_count=record_count,
-            counts=counts,
-            time_buckets=time_buckets,
-        )
+        record_count=record_count,
+        counts=counts,
+        time_buckets=time_buckets,
+        distinct_time_buckets=distinct_time_buckets,
+    )
 
         now = time.monotonic()
         if progress_seconds <= 0 or now - last_progress_at >= progress_seconds or next_start >= size:
@@ -562,7 +586,7 @@ def _aggregate_json_object_stream_content_resumable(
                 record = json.loads(raw_object.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            record_count += _update_aggregate_from_record(record, counts, time_buckets)
+        record_count += _update_aggregate_from_record(record, counts, time_buckets, distinct_time_buckets)
 
     top_counts = {
         field: _top_count_rows(field_counts, limit=200)
