@@ -1,13 +1,16 @@
 "use client";
 
+import { useState } from "react";
 import {
   Activity,
   BarChart3,
   BookOpen,
+  ChevronDown,
   Clock,
   Database,
   ListChecks,
   MousePointerClick,
+  X,
   Users,
 } from "lucide-react";
 import {
@@ -31,16 +34,37 @@ type ChartDatum = {
   score?: number;
 };
 
+type SourceDisclosureItem = {
+  label: string;
+  value?: unknown;
+  samples?: unknown[];
+};
+
+type SourceModalState = {
+  title: string;
+  samples: unknown[];
+} | null;
+
+type DecisionTraceItem = {
+  step: string;
+  detail: string;
+  evidence?: string[];
+};
+
 const CHART_COLORS = ["#2563eb", "#10b981", "#f97316", "#7c3aed", "#ec4899", "#64748b"];
+const HUMAN_LABEL_RE = /([a-z0-9])([A-Z])/g;
+const HUMAN_KEEP_ALL_CAPS = new Set(["API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"]);
 
 type DatasetSummary = {
   key: string;
   label?: string;
+  source_paths?: string[];
+  sourcePaths?: string[];
   s3Uri?: string;
   bucket?: string;
   objectType?: string;
   sizeBytes?: number | string;
-  etag?: string;
+  ETAG?: string;
   lastModified?: string;
   score?: number;
   matchedFields?: string[];
@@ -61,6 +85,8 @@ type ActivityRecord = {
 
 type ActivityDatasetMeta = {
   source?: string;
+  source_paths?: string[];
+  source_samples?: Record<string, unknown[]>;
   s3_uri?: string;
   bucket?: string;
   key?: string;
@@ -104,6 +130,8 @@ type ActivityDashboardPayload = {
     distinctEvents?: number;
     distinctCourses?: number;
     distinctUsers?: number;
+    sourcePaths?: string[];
+    sourceSamples?: Record<string, unknown[]>;
   };
   charts?: {
     events?: ChartDatum[];
@@ -125,6 +153,7 @@ type ActivityDashboardPayload = {
     subtitle?: string;
     blocks?: LayoutBlock[];
   };
+  decisionTrace?: DecisionTraceItem[];
   records?: ActivityRecord[];
 };
 
@@ -171,6 +200,338 @@ function previewText(value: unknown, fallback?: string, maxLength = 420): string
   const text = formatValue(value, fallback).replace(/\s+/g, " ").trim();
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength).trim()}...`;
+}
+
+function sourceValues(value: unknown): string[] {
+  if (value === null || value === undefined || value === "") return [];
+  if (Array.isArray(value)) return value.map((item) => formatValue(item)).filter(Boolean);
+  return [formatValue(value)].filter(Boolean);
+}
+
+function uniqueValues(values: Array<string | undefined | null>): string[] {
+  return Array.from(new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value))));
+}
+
+function isInternalDashboardSource(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/\\/g, "/");
+  return (
+    normalized.includes("dashboard_agent_") ||
+    normalized.includes("dashboard agent ") ||
+    normalized.startsWith("duckdb/") ||
+    normalized.startsWith("graph/")
+  );
+}
+
+function publicSourceValues(values: Array<string | undefined | null>): string[] {
+  return uniqueValues(values).filter((value) => !isInternalDashboardSource(value));
+}
+
+function sampleTitle(value: string): string {
+  return humanLabel(value) || value;
+}
+
+function sampleRowsForSource(samples: unknown[] | undefined, source: string): unknown[] {
+  const rows = samples ?? [];
+  if (!rows.length) return [];
+  const sourceLower = source.toLowerCase();
+  const directMatches = rows.filter((row) => {
+    if (!row || typeof row !== "object") return false;
+    const record = row as Record<string, unknown>;
+    const rowSource = String(record.source ?? record.source_path ?? record.sourceFile ?? record.path ?? "").toLowerCase();
+    return rowSource.includes(sourceLower) || sourceLower.includes(rowSource);
+  });
+  return directMatches.slice(0, 50);
+}
+
+function sampleObjectRows(samples: unknown[]): Record<string, unknown>[] {
+  return samples.filter((sample): sample is Record<string, unknown> => {
+    return Boolean(sample) && typeof sample === "object" && !Array.isArray(sample);
+  });
+}
+
+function sampleTableColumns(rows: Record<string, unknown>[]): string[] {
+  const columns: string[] = [];
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!columns.includes(key)) columns.push(key);
+      if (columns.length >= 12) return columns;
+    }
+  }
+  return columns;
+}
+
+function SampleDataModal({
+  state,
+  onClose,
+}: {
+  state: SourceModalState;
+  onClose: () => void;
+}) {
+  const [viewMode, setViewMode] = useState<"table" | "raw">("table");
+  if (!state) return null;
+  const tableRows = sampleObjectRows(state.samples);
+  const tableColumns = sampleTableColumns(tableRows);
+  const canShowTable = tableRows.length > 0 && tableColumns.length > 0;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-3 sm:p-5" role="dialog" aria-modal="true">
+      <div className="flex h-[90vh] max-h-[92vh] w-full max-w-[min(96vw,1280px)] flex-col overflow-hidden rounded-lg border bg-background shadow-xl">
+        <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold">Sample data</p>
+            <p className="mt-1 break-words text-xs text-muted-foreground">{state.title}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
+            aria-label="Close sample data"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs">
+          <button
+            type="button"
+            onClick={() => setViewMode("table")}
+            disabled={!canShowTable}
+            className={`rounded border px-2 py-1 transition ${
+              viewMode === "table" ? "bg-foreground text-background" : "bg-background text-foreground/70 hover:text-foreground"
+            } disabled:cursor-not-allowed disabled:opacity-40`}
+          >
+            Table
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("raw")}
+            className={`rounded border px-2 py-1 transition ${
+              viewMode === "raw" ? "bg-foreground text-background" : "bg-background text-foreground/70 hover:text-foreground"
+            }`}
+          >
+            Raw
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-4">
+          {state.samples.length && viewMode === "table" && canShowTable ? (
+            <div className="overflow-auto rounded-lg border">
+              <table className="min-w-full text-left text-xs">
+                <thead className="bg-muted/40 text-muted-foreground">
+                  <tr>
+                    {tableColumns.map((column) => (
+                      <th key={column} className="whitespace-nowrap px-3 py-2 font-medium">
+                        {humanLabel(column)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {tableRows.map((row, rowIndex) => (
+                    <tr key={rowIndex} className="border-t">
+                      {tableColumns.map((column) => (
+                        <td key={column} className="max-w-[360px] break-words px-3 py-2 align-top">
+                          {previewText(row[column], undefined, 220)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : state.samples.length ? (
+            <div className="space-y-3">
+              {state.samples.map((sample, index) => (
+                <pre
+                  key={index}
+                  className="overflow-auto rounded-lg border bg-muted/20 p-3 text-xs leading-relaxed text-foreground/85"
+                >
+                  {previewText(sample, undefined, 1400)}
+                </pre>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">No sample data is available in this widget payload.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SourceDisclosure({
+  label = "Show source",
+  items,
+}: {
+  label?: string;
+  items: SourceDisclosureItem[];
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [sampleModal, setSampleModal] = useState<SourceModalState>(null);
+  const visibleItems = items
+    .map((item) => ({ ...item, value: sourceValues(item.value) }))
+    .filter((item) => item.value.length);
+  if (!visibleItems.length) return null;
+
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+        className="group inline-flex max-w-full items-center gap-1 text-left text-xs text-foreground/35 transition hover:text-foreground/70"
+        aria-expanded={isOpen}
+      >
+        <ChevronDown
+          className={`h-3.5 w-3.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`}
+          aria-hidden="true"
+        />
+        <span className="truncate">{label}</span>
+      </button>
+      {isOpen ? (
+        <dl className="mt-2 grid gap-1 rounded-lg border bg-muted/10 p-3 text-xs">
+          {visibleItems.map((item, index) => (
+            <div key={`${item.label}-${index}`} className="grid gap-1 sm:grid-cols-[140px_1fr]">
+              <dt className="text-muted-foreground">{item.label}</dt>
+              <dd className="flex min-w-0 flex-wrap gap-1.5 font-medium text-foreground/80">
+                {item.value.map((value) => {
+                  const samples = sampleRowsForSource(item.samples, value);
+                  if (!samples.length) {
+                    return <span key={value} className="break-words">{value}</span>;
+                  }
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => setSampleModal({ title: value, samples })}
+                      className="max-w-full rounded border bg-background px-2 py-0.5 text-left text-foreground/70 transition hover:border-foreground/30 hover:text-foreground"
+                      title={`Show sample data for ${value}`}
+                    >
+                      <span className="block truncate">{sampleTitle(value)}</span>
+                    </button>
+                  );
+                })}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} />
+    </div>
+  );
+}
+
+function ReasoningDisclosure({ trace }: { trace?: DecisionTraceItem[] }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const items = (trace ?? []).filter((item) => item.step || item.detail);
+  if (!items.length) return null;
+
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+        className="group inline-flex max-w-full items-center gap-1 text-left text-xs text-foreground/35 transition hover:text-foreground/70"
+        aria-expanded={isOpen}
+      >
+        <ChevronDown
+          className={`h-3.5 w-3.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`}
+          aria-hidden="true"
+        />
+        <span className="truncate">Show reasoning</span>
+      </button>
+      {isOpen ? (
+        <ol className="mt-2 grid gap-2 rounded-lg border bg-muted/10 p-3 text-xs">
+          {items.map((item, index) => (
+            <li key={`${item.step}-${index}`} className="grid gap-1 sm:grid-cols-[140px_1fr]">
+              <span className="font-medium text-foreground/75">{item.step}</span>
+              <span className="min-w-0 text-foreground/80">
+                <span className="block break-words">{item.detail}</span>
+                {item.evidence?.length ? (
+                  <span className="mt-1 flex flex-wrap gap-1.5">
+                    {item.evidence.slice(0, 8).map((entry) => (
+                      <span key={entry} className="max-w-full rounded border bg-background px-1.5 py-0.5 text-foreground/60">
+                        {entry}
+                      </span>
+                    ))}
+                  </span>
+                ) : null}
+              </span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  );
+}
+
+function activitySourceItems(activity?: ActivityDashboardPayload): SourceDisclosureItem[] {
+  if (!activity) return [];
+  const datasetValues = Array.isArray(activity.datasets)
+    ? activity.datasets
+    : Object.values(activity.datasets ?? {});
+  const sourceMeta = datasetValues[0];
+  const summary = activity.summary ?? {};
+  const originalSources = publicSourceValues([
+    ...(summary.sourcePaths ?? []),
+    ...datasetValues.flatMap((dataset) => dataset.source_paths ?? []),
+    ...datasetValues.map((dataset) => dataset.s3_uri ?? dataset.source ?? "").filter(Boolean),
+  ]);
+  const sourceSamples = {
+    ...(summary.sourceSamples ?? {}),
+    ...datasetValues.reduce<Record<string, unknown[]>>((samples, dataset) => {
+      return { ...samples, ...(dataset.source_samples ?? {}) };
+    }, {}),
+  };
+  const chartPlan = activity.chartPlan ?? activity.chartSlots ?? [];
+  const sourceSampleRows = Object.entries(sourceSamples).flatMap(([source, rows]) =>
+    (rows ?? []).map((row) => (row && typeof row === "object" ? { ...(row as Record<string, unknown>), source } : { source, value: row })),
+  );
+  const sampleRows = sourceSampleRows.length
+    ? sourceSampleRows
+    : activity.records?.length
+      ? activity.records
+      : Object.entries(activity.charts ?? {}).flatMap(([chart, rows]) =>
+          (rows ?? []).slice(0, 8).map((row) => ({ chart, ...row })),
+        );
+  return [
+    {
+      label: "Dashboard sources",
+      value: originalSources,
+      samples: sampleRows,
+    },
+    { label: "Object type", value: sourceMeta?.object_type },
+    { label: "Rows used", value: summary.totalRecords ?? summary.sampleRecords ?? sourceMeta?.totalRecords },
+    { label: "Coverage", value: summary.isFullAggregate ? "Full aggregate" : "Sample records" },
+    { label: "Fields", value: chartPlan.map((slot) => humanLabel(slot.field)).filter(Boolean) },
+    { label: "Query plan", value: chartPlan.map((slot) => slot.reason).filter(Boolean).join(" ") },
+  ];
+}
+
+function graphSourceItems(payload: GraphDashboardWidgetPayload): SourceDisclosureItem[] {
+  const datasets = payload.datasets ?? [];
+  const results = payload.results ?? [];
+  const originalSources = publicSourceValues(
+    datasets.flatMap((dataset) => {
+      const sourcePaths = dataset.source_paths ?? dataset.sourcePaths ?? [];
+      return sourcePaths.length ? sourcePaths : [dataset.s3Uri ?? dataset.key];
+    }),
+  );
+  const evidenceSamples = results.map((item) => ({
+    label: item.label,
+    source: item.source ?? item.path ?? item.id,
+    score: item.score,
+    value: item.value,
+    text: item.text,
+  }));
+  return [
+    { label: "Graph objects", value: payload.status?.objects },
+    { label: "Graph nodes", value: payload.status?.nodes },
+    { label: "Graph edges", value: payload.status?.edges },
+    {
+      label: "Dashboard sources",
+      value: originalSources,
+      samples: evidenceSamples,
+    },
+    { label: "Matched fields", value: datasets.flatMap((dataset) => dataset.matchedFields ?? []) },
+    { label: "Evidence nodes", value: results.map((item) => item.source ?? item.path ?? item.id) },
+  ];
 }
 
 function formatNumber(value: unknown): string {
@@ -221,7 +582,27 @@ function formatDateTime(value: unknown): string {
 function humanLabel(value: string, kind?: "course" | "user"): string {
   if (kind === "course") return courseName(value);
   if (kind === "user") return shortId(value, 6);
-  return value.replace(/[_-]/g, " ");
+  const text = String(value ?? "").trim();
+  if (!text) return "Unknown";
+  const basename = text.replace(/\\/g, "/").split("/").pop() ?? text;
+  const stripped = basename
+    .replace(/^\$\.?/, "")
+    .replace(/\.(json|csv|tsv|parquet|ndjson|jsonl|sql|db|duckdb|txt)$/i, "")
+    .replace(HUMAN_LABEL_RE, "$1 $2")
+    .replace(/[_\-.]+/g, " ");
+  const words = stripped
+    .split(/\s+/)
+    .map((word) => {
+      const trimmed = word.trim();
+      if (!trimmed) return "";
+      const upper = trimmed.toUpperCase();
+      if (HUMAN_KEEP_ALL_CAPS.has(upper)) return upper;
+      if (/^[A-Z0-9]{2,4}$/.test(trimmed)) return upper;
+      if (/^\d+$/.test(trimmed)) return trimmed;
+      return trimmed.slice(0, 1).toUpperCase() + trimmed.slice(1).toLowerCase();
+    })
+    .filter(Boolean);
+  return words.length ? words.join(" ") : "Unknown";
 }
 
 function BreakdownList({
@@ -620,6 +1001,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
           {layoutSpec.subtitle ? (
             <p className="max-w-3xl text-sm text-muted-foreground">{layoutSpec.subtitle}</p>
           ) : null}
+          <SourceDisclosure items={activitySourceItems(activity)} />
+          <ReasoningDisclosure trace={activity?.decisionTrace} />
         </div>
       </div>
 
@@ -693,7 +1076,7 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
     ];
   const summary = activity?.summary ?? {};
   const sourceMeta = Object.values(activity?.datasets ?? {})[0];
-  const sourceName = sourceMeta?.key ?? records[0]?.source ?? "Matched activity data";
+  const sourceName = humanLabel(sourceMeta?.key ?? records[0]?.source ?? "Matched activity data");
   const eventLeader = charts.events?.[0];
   const recordTimes = records
     .map((record) => record["@timestamp"] ?? record.timestamp)
@@ -748,7 +1131,9 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
                 ? "Charts summarize the full file scan; table rows are a preview."
                 : "Values summarize retrieved sample records, not the full 11GB file."}
             </p>
-          </div>
+            <SourceDisclosure items={activitySourceItems(activity)} />
+            <ReasoningDisclosure trace={activity?.decisionTrace} />
+            </div>
           <div className="flex flex-wrap gap-2 text-xs">
             {sourceMeta?.object_type ? (
               <span className="rounded-full border bg-background px-3 py-1 font-medium uppercase">
@@ -815,7 +1200,7 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
             Top event
           </div>
           <p className="mt-2 text-sm font-medium">
-            {eventLeader ? `${eventLeader.label} (${formatNumber(eventLeader.value)})` : "No event sample"}
+            {eventLeader ? `${humanLabel(eventLeader.label)} (${formatNumber(eventLeader.value)})` : "No event sample"}
           </p>
         </div>
       </div>
@@ -889,7 +1274,7 @@ export function PowerBiWidget({
   const resultChart =
     payload.charts?.results ??
     results.map((item) => ({
-      label: item.label ?? item.path ?? item.source ?? "result",
+      label: humanLabel(item.label ?? item.path ?? item.source ?? "result"),
       score: item.score ?? 0,
     }));
 
@@ -907,6 +1292,7 @@ export function PowerBiWidget({
           <p className="text-xs text-muted-foreground">
             Dashboard backed by retrieved graph context
           </p>
+          <SourceDisclosure items={graphSourceItems(payload)} />
         </header>
       ) : null}
 
@@ -950,7 +1336,7 @@ export function PowerBiWidget({
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0">
                       <p className="break-words text-sm font-semibold">
-                        {dataset.label ? dataset.label.replace(/[-_]/g, " ") : dataset.key}
+                        {humanLabel(dataset.label ?? dataset.key)}
                       </p>
                       <p className="mt-1 break-words text-xs text-muted-foreground">
                         {dataset.s3Uri ?? dataset.key}
@@ -982,17 +1368,17 @@ export function PowerBiWidget({
                         <dd className="break-words font-medium">{dataset.lastModified}</dd>
                       </div>
                     ) : null}
-                    {dataset.etag ? (
+                    {dataset.ETAG ? (
                       <div>
-                        <dt className="text-muted-foreground">ETag</dt>
-                        <dd className="break-words font-medium">{dataset.etag}</dd>
+                        <dt className="text-muted-foreground">ETAG</dt>
+                        <dd className="break-words font-medium">{dataset.ETAG}</dd>
                       </div>
                     ) : null}
                     {dataset.matchedFields?.length ? (
                       <div>
                         <dt className="text-muted-foreground">Fields used in this view</dt>
                         <dd className="break-words font-medium">
-                          {dataset.matchedFields.slice(0, 6).join(", ")}
+                          {dataset.matchedFields.slice(0, 6).map((field) => humanLabel(field)).join(", ")}
                         </dd>
                       </div>
                     ) : null}
@@ -1018,7 +1404,7 @@ export function PowerBiWidget({
               {results.map((item, index) => (
                 <div key={`${item.id ?? item.path ?? index}`} className="text-sm">
                   <p className="font-medium">
-                    {item.label ?? item.path ?? item.source ?? "Graph node"}
+                    {humanLabel(item.label ?? item.path ?? item.source ?? "Graph node")}
                   </p>
                   <p className="break-words text-xs text-muted-foreground">
                     {item.source ?? item.path}

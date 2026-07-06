@@ -24,6 +24,7 @@ def build_joined_mart(database: Path) -> None:
             """
             create or replace table dashboard_agent_user_dim as
             select
+                source_path,
                 try_cast(json_extract_string(payload_json, '$.user_id') as bigint) as user_id,
                 json_extract_string(payload_json, '$.username') as username,
                 json_extract_string(payload_json, '$.email') as email,
@@ -50,6 +51,7 @@ def build_joined_mart(database: Path) -> None:
             """
             create or replace table dashboard_agent_user_course_fact as
             select
+                source_path,
                 try_cast(json_extract_string(payload_json, '$.user_id') as bigint) as user_id,
                 json_extract_string(payload_json, '$.course_id') as course_id,
                 json_extract_string(payload_json, '$.username') as username,
@@ -91,6 +93,7 @@ def build_joined_mart(database: Path) -> None:
             """
             create or replace table dashboard_agent_course_dim as
             select
+                any_value(source_path) as source_path,
                 course_id,
                 any_value(subject_name) as subject_name,
                 any_value(department_name) as department_name,
@@ -114,6 +117,7 @@ def build_joined_mart(database: Path) -> None:
             """
             create or replace table dashboard_agent_anonymous_user_map as
             select
+                source_path,
                 json_extract_string(payload_json, '$.anonymous_user_id') as anonymous_user_id,
                 try_cast(json_extract_string(payload_json, '$.user_id') as bigint) as user_id,
                 nullif(json_extract_string(payload_json, '$.course_id'), '') as course_id
@@ -128,6 +132,28 @@ def build_joined_mart(database: Path) -> None:
                 partition by
                     json_extract_string(payload_json, '$.anonymous_user_id'),
                     nullif(json_extract_string(payload_json, '$.course_id'), '')
+                order by record_index
+            ) = 1
+            """
+        )
+
+        log("creating dashboard_agent_institute_dim")
+        con.execute(
+            """
+            create or replace table dashboard_agent_institute_dim as
+            select
+                source_path,
+                nullif(json_extract_string(payload_json, '$.instituteId'), '') as institute_id,
+                nullif(json_extract_string(payload_json, '$.instituteName'), '') as institute_name,
+                json_extract_string(payload_json, '$.province') as province,
+                json_extract_string(payload_json, '$.district') as district,
+                json_extract_string(payload_json, '$.department') as department
+            from unified_records
+            where payload_json is not null
+              and nullif(json_extract_string(payload_json, '$.instituteId'), '') is not null
+              and nullif(json_extract_string(payload_json, '$.instituteName'), '') is not null
+            qualify row_number() over (
+                partition by nullif(json_extract_string(payload_json, '$.instituteId'), '')
                 order by record_index
             ) = 1
             """
@@ -149,6 +175,7 @@ def build_joined_mart(database: Path) -> None:
                     nullif(json_extract_string(payload_json, '$.appID'), '') as app_id,
                     nullif(json_extract_string(payload_json, '$.eventCategory'), '') as event_category,
                     nullif(json_extract_string(payload_json, '$.event'), '') as event_name,
+                    source_path as activity_source_path,
                     payload_json as activity_payload_json
                 from unified_records
                 where source_path = 'edx-elastic/ae-activity-data-stream.json'
@@ -157,7 +184,9 @@ def build_joined_mart(database: Path) -> None:
             mapped as (
                 select
                     a.*,
-                    coalesce(map_course.user_id, map_any.user_id, try_cast(a.activity_user_id as bigint)) as mapped_user_id
+                    coalesce(map_course.user_id, map_any.user_id, try_cast(a.activity_user_id as bigint)) as mapped_user_id,
+                    map_course.source_path as anonymous_map_course_source_path,
+                    map_any.source_path as anonymous_map_any_source_path
                 from activity a
                 left join dashboard_agent_anonymous_user_map map_course
                   on map_course.anonymous_user_id = a.activity_user_id
@@ -177,7 +206,7 @@ def build_joined_mart(database: Path) -> None:
                 coalesce(uc.username, u.username) as username,
                 coalesce(uc.email, u.email) as email,
                 coalesce(uc.full_name, u.full_name) as full_name,
-                coalesce(uc.school_name, u.school_name) as school_name,
+                coalesce(inst.institute_name, uc.school_name, u.school_name) as school_name,
                 coalesce(uc.school_province, u.school_province) as school_province,
                 coalesce(uc.province, u.school_province) as province,
                 u.institute_id,
@@ -207,6 +236,13 @@ def build_joined_mart(database: Path) -> None:
                 m.app_id,
                 m.event_category,
                 m.event_name,
+                m.activity_source_path,
+                m.anonymous_map_course_source_path,
+                m.anonymous_map_any_source_path,
+                u.source_path as user_source_path,
+                uc.source_path as user_course_source_path,
+                c.source_path as course_source_path,
+                inst.source_path as institute_source_path,
                 m.activity_payload_json
             from mapped m
             left join dashboard_agent_user_dim u
@@ -216,6 +252,8 @@ def build_joined_mart(database: Path) -> None:
              and uc.course_id = m.course_id
             left join dashboard_agent_course_dim c
               on c.course_id = m.course_id
+            left join dashboard_agent_institute_dim inst
+              on inst.institute_id = u.institute_id
             """
         )
 
@@ -225,32 +263,35 @@ def build_joined_mart(database: Path) -> None:
             create or replace table dashboard_agent_activity_hourly_cache as
             with hourly as (
                 select
+                    activity_source_path as source_path,
                     event_hour,
                     count(*) as records,
                     count(distinct activity_user_id) as users
                 from dashboard_agent_activity_joined
                 where event_hour is not null
-                group by event_hour
+                group by activity_source_path, event_hour
             ),
             first_seen as (
                 select
+                    activity_source_path as source_path,
                     activity_user_id,
                     min(event_hour) as first_event_hour
                 from dashboard_agent_activity_joined
                 where event_hour is not null
                   and activity_user_id is not null
                   and activity_user_id <> ''
-                group by activity_user_id
+                group by activity_source_path, activity_user_id
             ),
             first_seen_counts as (
                 select
+                    source_path,
                     first_event_hour as event_hour,
                     count(*) as first_seen_users
                 from first_seen
-                group by first_event_hour
+                group by source_path, first_event_hour
             )
             select
-                'edx-elastic/ae-activity-data-stream.json' as source_path,
+                h.source_path,
                 '@timestamp' as timestamp_field,
                 'userID' as user_field,
                 strftime(h.event_hour, '%Y-%m-%d %H:%M') as label,
@@ -266,7 +307,46 @@ def build_joined_mart(database: Path) -> None:
                 ) as cumulative_users,
                 current_timestamp as updated_at
             from hourly h
-            left join first_seen_counts f using (event_hour)
+            left join first_seen_counts f using (source_path, event_hour)
+            """
+        )
+
+        log("creating dashboard_agent_table_lineage")
+        con.execute(
+            """
+            create or replace table dashboard_agent_table_lineage as
+            with lineage(table_name, source_path) as (
+                select 'dashboard_agent_user_dim', source_path from dashboard_agent_user_dim
+                union all
+                select 'dashboard_agent_user_course_fact', source_path from dashboard_agent_user_course_fact
+                union all
+                select 'dashboard_agent_course_dim', source_path from dashboard_agent_course_dim
+                union all
+                select 'dashboard_agent_anonymous_user_map', source_path from dashboard_agent_anonymous_user_map
+                union all
+                select 'dashboard_agent_institute_dim', source_path from dashboard_agent_institute_dim
+                union all
+                select 'dashboard_agent_activity_joined', activity_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', anonymous_map_course_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', anonymous_map_any_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', user_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', user_course_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', course_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_joined', institute_source_path from dashboard_agent_activity_joined
+                union all
+                select 'dashboard_agent_activity_hourly_cache', source_path from dashboard_agent_activity_hourly_cache
+            )
+            select table_name, source_path, count(*) as rows_using_source
+            from lineage
+            where source_path is not null and source_path <> ''
+            group by table_name, source_path
+            order by table_name, source_path
             """
         )
 
@@ -276,8 +356,10 @@ def build_joined_mart(database: Path) -> None:
             "dashboard_agent_user_course_fact",
             "dashboard_agent_course_dim",
             "dashboard_agent_anonymous_user_map",
+            "dashboard_agent_institute_dim",
             "dashboard_agent_activity_joined",
             "dashboard_agent_activity_hourly_cache",
+            "dashboard_agent_table_lineage",
         ):
             count = con.execute(f"select count(*) from {table}").fetchone()[0]
             log(f"{table}: {count:,} rows")

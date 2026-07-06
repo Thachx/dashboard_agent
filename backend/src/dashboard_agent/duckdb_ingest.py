@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -296,6 +297,7 @@ def _ranked_dimension_payload(
         "aggregate_kind": "ranked_dimension",
         "duckdb_database": str(db_path),
         "duckdb_table": table,
+        "source_paths": _source_paths_for_table(con, table, fields=[dimension, measure]),
         "dimension_field": dimension,
         "measure_field": measure,
         "dimension_label": _display_name(dimension),
@@ -369,6 +371,7 @@ def _activity_time_series_aggregate_object(con: Any, db_path: Path) -> JsonObjec
         "aggregate_kind": "time_series",
         "duckdb_database": str(db_path),
         "duckdb_table": "dashboard_agent_activity_hourly_cache",
+        "source_paths": _source_paths_for_table(con, "dashboard_agent_activity_hourly_cache", fields=["time", "records", "users"]),
         "time_field": "label",
         "records_series": records_data,
         "users_series": users_data,
@@ -393,6 +396,116 @@ def _is_rank_dimension_column(column: str) -> bool:
         token in lowered
         for token in ("name", "school", "institute", "department", "province", "course", "category", "type", "status")
     )
+
+
+def _source_paths_for_table(con: Any, table: str, *, fields: list[str] | None = None) -> list[str]:
+    if not table:
+        return []
+    if _table_exists(con, "dashboard_agent_table_lineage"):
+        rows = con.execute(
+            """
+            select distinct source_path
+            from dashboard_agent_table_lineage
+            where table_name = ?
+              and source_path is not null
+              and source_path <> ''
+            order by source_path
+            """,
+            [table],
+        ).fetchall()
+        paths = _dedupe_source_paths([str(row[0]) for row in rows])
+        if paths:
+            return paths
+
+    columns = _table_columns(con, table)
+    source_columns = [column for column in columns if column == "source_path" or column.endswith("_source_path")]
+    if source_columns:
+        selects = [
+            f"select distinct {_quote_identifier(column)} as source_path from {_quote_identifier(table)}"
+            for column in source_columns
+        ]
+        rows = con.execute(" union ".join(selects) + " order by source_path limit 50").fetchall()
+        paths = _dedupe_source_paths([str(row[0]) for row in rows if row[0]])
+        if paths:
+            return paths
+
+    return _infer_source_paths_for_table(con, table, columns, fields=fields or [])
+
+
+def _table_columns(con: Any, table: str) -> list[str]:
+    try:
+        return [str(row[1]) for row in con.execute(f"pragma table_info({_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return []
+
+
+def _infer_source_paths_for_table(con: Any, table: str, columns: list[str], *, fields: list[str] | None = None) -> list[str]:
+    if not _table_exists(con, "source_summary"):
+        return []
+    target_text = " ".join(fields or []).strip()
+    if not target_text:
+        target_text = " ".join([table, " ".join(columns)])
+    target_terms = _term_set(target_text)
+    if not target_terms:
+        return []
+    rows = con.execute(
+        """
+        select source_path, source_table, records
+        from source_summary
+        where records > 0
+        order by records desc, source_path
+        """
+    ).fetchall()
+    scored_by_path: dict[str, tuple[int, int, str]] = {}
+    for source_path, source_table, records in rows:
+        source_path = str(source_path)
+        lineage_path = _lineage_source_path(source_path)
+        source_terms = _term_set(f"{source_path} {source_table or ''}")
+        score = len(target_terms & source_terms)
+        if score > 0:
+            previous = scored_by_path.get(lineage_path)
+            next_value = (score, int(records or 0), lineage_path)
+            if previous is None:
+                scored_by_path[lineage_path] = next_value
+            else:
+                scored_by_path[lineage_path] = (max(previous[0], score), previous[1] + int(records or 0), lineage_path)
+    scored = list(scored_by_path.values())
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return _dedupe_source_paths([source_path for _score, _records, source_path in scored[:8]])
+
+
+def _lineage_source_path(source_path: str) -> str:
+    normalized = str(source_path or "").replace("\\", "/").strip()
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "parquet":
+        return f"{parts[0]}/{parts[1]}.parquet"
+    if len(parts) == 3 and parts[2] == f"{parts[1]}.json":
+        return f"{parts[0]}/{parts[2]}"
+    return normalized
+
+
+def _term_set(text: str) -> set[str]:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+    terms: set[str] = set()
+    for term in re.split(r"[^a-zA-Z0-9]+", normalized.lower()):
+        if len(term) <= 1:
+            continue
+        terms.add(term)
+        if term.endswith("s") and len(term) > 3:
+            terms.add(term[:-1])
+    return terms
+
+
+def _dedupe_source_paths(paths: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        normalized = path.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
 
 
 def _is_rank_measure_column(column: str) -> bool:

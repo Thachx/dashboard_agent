@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
@@ -25,6 +26,18 @@ _settings: Settings | None = None
 _store: Any | None = None
 _duckdb_field_cache: dict[str, dict[str, str]] = {}
 SAMPLE_FIELD_RE = re.compile(r"^\$\.sample_records\[(\d+)\]\.(.+)$")
+HUMAN_LABEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+HUMAN_KEEP_ALL_CAPS = {"API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"}
+INTENT_SYNONYMS = {
+    "finish": {"complete", "completed", "completion", "status", "result"},
+    "finished": {"complete", "completed", "completion", "status", "result"},
+    "complete": {"finished", "completion", "status", "result"},
+    "completed": {"finished", "complete", "completion", "status", "result"},
+    "read": {"reading", "learn", "learning", "content", "course"},
+    "reading": {"read", "learn", "learning", "content", "course"},
+    "learn": {"learning", "read", "reading", "course"},
+    "learning": {"learn", "read", "reading", "course", "status"},
+}
 DASHBOARD_BUILDING_INSTRUCTIONS = (
     "Build dashboards for the user's data domain, not for graph internals. "
     "Use this workflow: 1) decide which chart types fit the retrieved fields and grain, "
@@ -286,11 +299,42 @@ def _field_matches_question(field_hint: str, question: str, fields: dict[str, An
 
 
 def _intent_terms(text: str) -> list[str]:
-    return [
+    terms = [
         term
         for term in re.findall(r"[a-z0-9]+", text.lower())
-        if len(term) >= 2 and term not in {"over", "time", "trend", "number", "count", "total", "show", "have"}
+        if len(term) >= 2
+        and term
+        not in {
+            "a",
+            "an",
+            "and",
+            "are",
+            "can",
+            "for",
+            "have",
+            "of",
+            "over",
+            "please",
+            "show",
+            "that",
+            "the",
+            "time",
+            "to",
+            "total",
+            "trend",
+            "with",
+            "number",
+            "count",
+        }
     ]
+    expanded = list(terms)
+    seen = set(expanded)
+    for term in terms:
+        for synonym in INTENT_SYNONYMS.get(term, set()):
+            if synonym not in seen:
+                seen.add(synonym)
+                expanded.append(synonym)
+    return expanded
 
 
 def _field_terms(field: str) -> set[str]:
@@ -311,8 +355,30 @@ def _field_score(field: str, intent_terms: set[str]) -> float:
 
 
 def _humanize_field(field: str) -> str:
-    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", field).replace("_", " ").replace("-", " ")
-    return " ".join(word.capitalize() if word.islower() else word for word in spaced.split())
+    text = str(field or "").strip()
+    if not text:
+        return "Unknown"
+    text = text.replace("\\", "/").rsplit("/", 1)[-1]
+    text = re.sub(r"^\$\.?", "", text)
+    text = re.sub(r"\.(json|csv|tsv|parquet|ndjson|jsonl|sql|db|duckdb|txt)$", "", text, flags=re.IGNORECASE)
+    text = HUMAN_LABEL_RE.sub(r"\1 \2", text)
+    text = text.replace("_", " ").replace("-", " ")
+    words: list[str] = []
+    for raw_word in text.split():
+        word = raw_word.strip()
+        if not word:
+            continue
+        if word.upper() in HUMAN_KEEP_ALL_CAPS:
+            words.append(word.upper() if len(word) <= 4 else word.title())
+            continue
+        if word.isupper() and len(word) <= 4:
+            words.append(word)
+            continue
+        if word.isdigit():
+            words.append(word)
+            continue
+        words.append(word[:1].upper() + word[1:].lower())
+    return " ".join(words) if words else "Unknown"
 
 
 def _slot_safe_field(field: str) -> str:
@@ -322,6 +388,30 @@ def _slot_safe_field(field: str) -> str:
 
 def _duckdb_quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def _duckdb_database_path(store: Any) -> Path | None:
+    candidates: list[Path] = []
+    store_path = getattr(store, "path", None)
+    for raw_path in (store_path, get_settings().graph_path):
+        if raw_path is None:
+            continue
+        path = Path(raw_path)
+        candidates.append(path.parent / "dashboard_agent.duckdb")
+        candidates.append(path.parent / "_warehouse" / "dashboard_agent.duckdb")
+    cwd = Path.cwd()
+    candidates.extend(
+        [
+            cwd / "data" / "_warehouse" / "dashboard_agent.duckdb",
+            cwd.parent / "data" / "_warehouse" / "dashboard_agent.duckdb",
+            cwd / "data" / "dashboard_agent.duckdb",
+            cwd.parent / "data" / "dashboard_agent.duckdb",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else None
 
 
 def _aggregate_cache_activity(store: Any, question: str) -> dict[str, Any]:
@@ -388,6 +478,15 @@ def _aggregate_cache_activity(store: Any, question: str) -> dict[str, Any]:
         },
     }
     activity["layoutSpec"] = _activity_layout_spec(question, activity)
+    activity["decisionTrace"] = _activity_decision_trace(
+        question=question,
+        source_kind="aggregate cache",
+        source=str(source or ""),
+        source_paths=[str(source)] if source else [],
+        chart_slots=chart_slots,
+        layout_spec=activity["layoutSpec"],
+        summary=activity["summary"],
+    )
     return activity
 
 
@@ -395,11 +494,8 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
     lowered = question.lower()
     if not any(term in lowered for term in ("activity", "event", "user", "learner", "student", "course", "time", "trend")):
         return {}
-    db_path = getattr(store, "path", None)
-    if db_path is None:
-        return {}
-    db_path = db_path.parent / "dashboard_agent.duckdb"
-    if not db_path.exists():
+    db_path = _duckdb_database_path(store)
+    if db_path is None or not db_path.exists():
         return {}
     try:
         import duckdb
@@ -433,13 +529,32 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
         timeline = _duckdb_time_buckets(con, source_path, timestamp_field, user_field)
         counts: dict[str, list[dict[str, Any]]] = {}
         count_fields: list[str] = []
+        intent_terms = set(_intent_terms(question))
+        source_fields = _duckdb_json_field_names(con, source_path)
+        matched_count_fields = [
+            field
+            for field in sorted(source_fields, key=lambda field: (-_field_score(field, intent_terms), field.lower()))
+            if _field_score(field, intent_terms) > 0
+        ]
         if not wants_user_time:
-            count_fields = [field for field in (event_field, category_field, course_field, app_field, user_field) if field]
+            count_fields = [
+                field
+                for field in (
+                    *matched_count_fields[:6],
+                    event_field,
+                    category_field,
+                    course_field,
+                    app_field,
+                    user_field,
+                )
+                if field
+            ]
         else:
             if "event" in lowered:
                 count_fields.extend(field for field in (event_field, category_field) if field)
             if "course" in lowered and course_field:
                 count_fields.append(course_field)
+        count_fields = list(dict.fromkeys(count_fields))[:8]
         for field in count_fields:
             if field:
                 counts[field] = _duckdb_top_counts(con, source_path, field)
@@ -490,6 +605,8 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
         chart_slots = _retitle_slots_for_prompt(question, chart_slots)
         chart_plan = [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots]
         total_records = source.get("records")
+        source_paths = [source_path] if source_path else []
+        source_samples = _source_sample_records(con, source_paths, limit_per_source=50)
         distinct_users = _duckdb_distinct_activity_users(con) if wants_user_time else (
             _duckdb_distinct_count(con, source_path, user_field) if user_field else 0
         )
@@ -498,6 +615,8 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
                 source_path: {
                     "source": source_path,
                     "key": source_path,
+                    "source_paths": source_paths,
+                    "source_samples": source_samples,
                     "object_type": source.get("source_format"),
                     "source_table": source.get("source_table"),
                     "sampleRecords": len(records),
@@ -511,6 +630,8 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
             "charts": {slot["id"]: slot["data"] for slot in chart_slots},
             "summary": {
                 "source": source_path,
+                "sourcePaths": source_paths,
+                "sourceSamples": source_samples,
                 "sampleRecords": len(records),
                 "totalRecords": total_records,
                 "isFullAggregate": True,
@@ -520,6 +641,16 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
             },
         }
         activity["layoutSpec"] = _activity_layout_spec(question, activity)
+        activity["decisionTrace"] = _activity_decision_trace(
+            question=question,
+            source_kind="duckdb",
+            source=source_path,
+            source_paths=source_paths,
+            chart_slots=chart_slots,
+            layout_spec=activity["layoutSpec"],
+            summary=activity["summary"],
+            fields=[field for field in (timestamp_field, user_field, event_field, category_field, course_field, app_field) if field],
+        )
         return activity
     except Exception:
         return {}
@@ -596,18 +727,33 @@ def _graph_time_series_activity_context(store: Any, question: str) -> dict[str, 
         )
     if not chart_slots:
         return {}
+    source_paths = _aggregate_source_paths(aggregate, question, ["time", "records", "users"])
+    source_samples = _source_sample_records_from_duckdb(aggregate, source_paths)
     summary = {
         "source": aggregate.get("duckdb_table") or "graph aggregate",
+        "sourcePaths": source_paths,
+        "sourceSamples": source_samples,
         "sampleRecords": len(chart_slots[0].get("data") or []),
         "totalRecords": aggregate.get("total_records"),
         "isFullAggregate": True,
         "distinctUsers": aggregate.get("total_users"),
     }
+    decision_trace = _time_series_decision_trace(
+        question=question,
+        source_kind="graph aggregate",
+        table=str(summary["source"]),
+        source_paths=source_paths,
+        chart_slots=chart_slots,
+        total_records=summary["totalRecords"],
+        total_users=summary["distinctUsers"],
+    )
     activity = {
         "datasets": {
             "graph/time_series": {
                 "source": "graph/time_series",
                 "key": "graph/time_series",
+                "source_paths": source_paths,
+                "source_samples": source_samples,
                 "object_type": "graph_aggregate",
                 "sampleRecords": summary["sampleRecords"],
                 "totalRecords": summary["totalRecords"],
@@ -619,6 +765,7 @@ def _graph_time_series_activity_context(store: Any, question: str) -> dict[str, 
         "chartSlots": chart_slots,
         "charts": {slot["id"]: slot["data"] for slot in chart_slots},
         "summary": summary,
+        "decisionTrace": decision_trace,
     }
     activity["layoutSpec"] = _activity_layout_spec(question, activity)
     return activity
@@ -639,6 +786,542 @@ def _graph_aggregate_values(store: Any, aggregate_kind: str) -> list[dict[str, A
     return values
 
 
+def _aggregate_source_paths(
+    aggregate: dict[str, Any],
+    question: str = "",
+    fields: list[str] | None = None,
+) -> list[str]:
+    explicit = aggregate.get("source_paths")
+    if isinstance(explicit, list):
+        paths = _dedupe_source_paths([str(path) for path in explicit if path])
+        if paths:
+            return paths
+    table = str(aggregate.get("duckdb_table") or "")
+    db_paths = [aggregate.get("duckdb_database"), _duckdb_database_path(get_store())]
+    for db_path in db_paths:
+        if not db_path:
+            continue
+        paths = _source_paths_from_duckdb_database(db_path, table, question=question, fields=fields or [])
+        if paths:
+            return paths
+    return []
+
+
+def _dedupe_source_paths(paths: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        normalized = path.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _source_paths_from_duckdb_database(
+    db_path: Any,
+    table: str,
+    *,
+    question: str = "",
+    fields: list[str] | None = None,
+) -> list[str]:
+    if not db_path or not table:
+        return []
+    try:
+        import duckdb
+    except ImportError:
+        return []
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return []
+    try:
+        return _source_paths_for_table(con, table, question=question, fields=fields or [])
+    except Exception:
+        return []
+    finally:
+        con.close()
+
+
+def _source_paths_for_table(
+    con: Any,
+    table: str,
+    *,
+    question: str = "",
+    fields: list[str] | None = None,
+) -> list[str]:
+    if not table:
+        return []
+    if _duckdb_table_exists(con, "dashboard_agent_table_lineage"):
+        rows = con.execute(
+            """
+            select distinct source_path
+            from dashboard_agent_table_lineage
+            where table_name = ?
+              and source_path is not null
+              and source_path <> ''
+            order by source_path
+            """,
+            [table],
+        ).fetchall()
+        paths = _dedupe_source_paths([str(row[0]) for row in rows])
+        if paths:
+            return paths
+
+    columns = _duckdb_table_columns(con, table)
+    source_columns = [column for column in columns if column == "source_path" or column.endswith("_source_path")]
+    if source_columns:
+        selects = [
+            f"select distinct {_duckdb_quote_identifier(column)} as source_path from {_duckdb_quote_identifier(table)}"
+            for column in source_columns
+        ]
+        rows = con.execute(
+            " union ".join(selects) + " order by source_path limit 50"
+        ).fetchall()
+        paths = _dedupe_source_paths([str(row[0]) for row in rows if row[0]])
+        if paths:
+            return paths
+
+    return _infer_source_paths_for_table(con, table, columns, question=question, fields=fields or [])
+
+
+def _duckdb_table_columns(con: Any, table: str) -> list[str]:
+    try:
+        return [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return []
+
+
+def _infer_source_paths_for_table(
+    con: Any,
+    table: str,
+    columns: list[str],
+    *,
+    question: str = "",
+    fields: list[str] | None = None,
+) -> list[str]:
+    if not _duckdb_table_exists(con, "source_summary"):
+        return []
+    target_text = " ".join([question, " ".join(fields or [])]).strip()
+    if not target_text:
+        target_text = " ".join([table, " ".join(columns)])
+    target_terms = _lineage_terms(target_text)
+    dimension_text_parts = (fields or [])[:1]
+    lowered_question = question.lower()
+    if "institute" in lowered_question or "institution" in lowered_question:
+        dimension_text_parts += ["institute institution school name"]
+    dimension_terms = _lineage_terms(" ".join(dimension_text_parts))
+    table_terms = _lineage_terms(table)
+    if not target_terms:
+        return []
+    rows = con.execute(
+        """
+        select source_path, source_table, records
+        from source_summary
+        where records > 0
+        order by records desc, source_path
+        """
+    ).fetchall()
+    scored_by_path: dict[str, tuple[int, int, str]] = {}
+    for source_path, source_table, records in rows:
+        source_path = str(source_path)
+        lineage_path = _lineage_source_path(source_path)
+        source_terms = _lineage_terms(f"{source_path} {source_table or ''}")
+        score = len(target_terms & source_terms)
+        score += 8 * len(dimension_terms & source_terms)
+        if "fact" in table_terms and "fact" in source_terms:
+            score += 6
+        if "dim" in source_terms:
+            score += 4
+        if score > 0:
+            previous = scored_by_path.get(lineage_path)
+            next_value = (score, int(records or 0), lineage_path)
+            if previous is None:
+                scored_by_path[lineage_path] = next_value
+            else:
+                scored_by_path[lineage_path] = (max(previous[0], score), previous[1] + int(records or 0), lineage_path)
+    scored = list(scored_by_path.values())
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return _dedupe_source_paths([source_path for _score, _records, source_path in scored[:8]])
+
+
+def _lineage_source_path(source_path: str) -> str:
+    normalized = str(source_path or "").replace("\\", "/").strip()
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 3 and parts[0] == "parquet":
+        return f"{parts[0]}/{parts[1]}.parquet"
+    if len(parts) == 3 and parts[2] == f"{parts[1]}.json":
+        return f"{parts[0]}/{parts[2]}"
+    return normalized
+
+
+def _lineage_terms(text: str) -> set[str]:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+    terms: set[str] = set()
+    for term in re.findall(r"[a-z0-9]+", normalized.lower()):
+        if len(term) < 2 or term in {"over", "time", "trend", "number", "count", "total", "show", "have"}:
+            continue
+        terms.add(term)
+        if term.endswith("s") and len(term) > 3:
+            terms.add(term[:-1])
+    return terms
+
+
+def _ranked_sample_records_from_duckdb(
+    aggregate: dict[str, Any],
+    table: str,
+    dimension: str,
+    top_label: str,
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    db_path = aggregate.get("duckdb_database")
+    if not db_path:
+        return []
+    try:
+        import duckdb
+    except ImportError:
+        return []
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return []
+    try:
+        return _ranked_sample_records(con, table, dimension, top_label, limit=limit)
+    except Exception:
+        return []
+    finally:
+        con.close()
+
+
+def _source_sample_records_from_duckdb(
+    aggregate: dict[str, Any],
+    source_paths: list[str],
+    *,
+    limit_per_source: int = 50,
+) -> dict[str, list[dict[str, Any]]]:
+    db_path = aggregate.get("duckdb_database")
+    if not db_path or not source_paths:
+        return {}
+    try:
+        import duckdb
+    except ImportError:
+        return {}
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return {}
+    try:
+        return _source_sample_records(con, source_paths, limit_per_source=limit_per_source)
+    except Exception:
+        return {}
+    finally:
+        con.close()
+
+
+def _source_sample_records(
+    con: Any,
+    source_paths: list[str],
+    *,
+    limit_per_source: int = 50,
+) -> dict[str, list[dict[str, Any]]]:
+    if not source_paths:
+        return {}
+    if not _duckdb_table_exists(con, "unified_records"):
+        return {}
+    samples: dict[str, list[dict[str, Any]]] = {}
+    for source_path in source_paths:
+        rows = con.execute(
+            """
+            select record_index, payload_json
+            from unified_records
+            where source_path = ?
+              and payload_json is not null
+            order by record_index
+            limit ?
+            """,
+            [source_path, int(limit_per_source)],
+        ).fetchall()
+        source_samples: list[dict[str, Any]] = []
+        for record_index, payload_json in rows:
+            try:
+                payload = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                payload = {"payload_json": str(payload_json)}
+            if isinstance(payload, dict):
+                source_samples.append({"source": source_path, "record_index": int(record_index), **payload})
+        if source_samples:
+            samples[source_path] = source_samples
+    return samples
+
+
+def _ranked_sample_records(
+    con: Any,
+    table: str,
+    dimension: str,
+    top_label: str,
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    try:
+        columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return []
+    if not columns:
+        return []
+    selected_columns = _sample_record_columns(columns)
+    if not selected_columns:
+        selected_columns = columns[:16]
+    select_sql = ", ".join(_duckdb_quote_identifier(column) for column in selected_columns)
+    rows = con.execute(
+        f"""
+        select {select_sql}
+        from {_duckdb_quote_identifier(table)}
+        where {_duckdb_quote_identifier(dimension)} is not null
+          and cast({_duckdb_quote_identifier(dimension)} as varchar) = ?
+        limit ?
+        """,
+        [top_label, int(limit)],
+    ).fetchall()
+    records: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        record = {"source": table, "index": index}
+        record.update({column: _json_safe_value(value) for column, value in zip(selected_columns, row)})
+        records.append(record)
+    return records
+
+
+def _sample_record_columns(columns: list[str]) -> list[str]:
+    preferred_tokens = (
+        "school",
+        "institute",
+        "user",
+        "course",
+        "subject",
+        "event",
+        "category",
+        "province",
+        "activity",
+        "grade",
+        "status",
+        "date",
+        "time",
+        "name",
+        "id",
+    )
+    scored: list[tuple[int, int, str]] = []
+    for index, column in enumerate(columns):
+        lowered = column.lower()
+        if lowered.endswith("_payload_json"):
+            continue
+        score = sum(1 for token in preferred_tokens if token in lowered)
+        scored.append((-score, index, column))
+    return [column for _score, _index, column in sorted(scored)[:18]]
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return value.isoformat()
+    except AttributeError:
+        return str(value)
+
+
+def _decision_trace_item(step: str, detail: str, evidence: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "step": step,
+        "detail": detail,
+        "evidence": [str(item) for item in (evidence or []) if item is not None and str(item) != ""],
+    }
+
+
+def _result_type_label(
+    dashboard_type: str,
+    *,
+    dimension_label: str | None = None,
+    measure_label: str | None = None,
+    chart_titles: list[str] | None = None,
+) -> str:
+    if dashboard_type == "ranked":
+        return f"ranked comparison: {dimension_label or 'dimension'} by {measure_label or 'measure'}"
+    if dashboard_type == "time_series":
+        charts = ", ".join(chart_titles or [])
+        return f"time-series trend{f': {charts}' if charts else ''}"
+    if dashboard_type == "distribution":
+        return f"distribution: {dimension_label or 'category'} by {measure_label or 'count'}"
+    if dashboard_type == "activity":
+        charts = ", ".join(chart_titles or [])
+        return f"field-matched activity dashboard{f': {charts}' if charts else ''}"
+    return dashboard_type.replace("_", " ")
+
+
+def _ranked_decision_trace(
+    *,
+    question: str,
+    source_kind: str,
+    table: str,
+    dimension: str,
+    measure: str,
+    dimension_label: str,
+    measure_label: str,
+    source_paths: list[str],
+    chart_data: list[dict[str, Any]],
+    total_measure: int,
+    total_dimensions: int,
+) -> list[dict[str, Any]]:
+    return [
+        _decision_trace_item(
+            "Interpret request",
+            "Agent decided this should be a ranked aggregate because the request asks for the highest values.",
+            [
+                f"User request: {question}",
+                f"Agent decided: {_result_type_label('ranked', dimension_label=dimension_label, measure_label=measure_label)}",
+            ],
+        ),
+        _decision_trace_item(
+            "Select data",
+            f"Selected {table} from {source_kind} context because it contains the ranked dimension and measure.",
+            [f"Dimension field: {dimension}", f"Measure field: {measure}", f"Rows in chart: {len(chart_data)}"],
+        ),
+        _decision_trace_item(
+            "Collect lineage",
+            "Resolved dashboard sources from DuckDB lineage metadata, source path columns, or source_summary fallback.",
+            source_paths[:8],
+        ),
+        _decision_trace_item(
+            "Choose layout",
+            "Used two KPI cards plus a horizontal bar chart because ranked labels can be long and need readable comparison.",
+            [
+                f"Top metric: {chart_data[0].get('label') if chart_data else 'not available'}",
+                f"Total distinct {measure_label}: {total_measure}",
+                f"Distinct {dimension_label}: {total_dimensions}",
+            ],
+        ),
+        _decision_trace_item(
+            "Bind chart",
+            f"Bound {dimension_label} to bar labels and distinct {measure_label} to bar values.",
+            [f"Chart type: horizontal_bar", f"Top bars shown: {len(chart_data)}"],
+        ),
+    ]
+
+
+def _time_series_decision_trace(
+    *,
+    question: str,
+    source_kind: str,
+    table: str,
+    source_paths: list[str],
+    chart_slots: list[dict[str, Any]],
+    total_records: Any,
+    total_users: Any,
+) -> list[dict[str, Any]]:
+    return [
+        _decision_trace_item(
+            "Interpret request",
+            "Agent decided this should be a time-series dashboard because the request asks for change over time.",
+            [
+                f"User request: {question}",
+                f"Agent decided: {_result_type_label('time_series', chart_titles=[str(slot.get('title', slot.get('id', 'chart'))) for slot in chart_slots])}",
+            ],
+        ),
+        _decision_trace_item(
+            "Select data",
+            f"Selected {table} from {source_kind} context because it has precomputed time buckets.",
+            [f"Activity rows: {total_records}", f"Distinct users: {total_users}"],
+        ),
+        _decision_trace_item(
+            "Collect lineage",
+            "Resolved original sources from DuckDB lineage metadata, source path columns, or source_summary fallback.",
+            source_paths[:8],
+        ),
+        _decision_trace_item(
+            "Choose layout",
+            "Used KPI cards plus line chart blocks because ordered time buckets are best read as trends.",
+            [f"Charts selected: {', '.join(slot.get('title', slot.get('id', 'chart')) for slot in chart_slots)}"],
+        ),
+        _decision_trace_item(
+            "Bind chart",
+            "Bound time bucket labels to the x-axis and aggregate counts to the y-axis.",
+            [f"Chart count: {len(chart_slots)}"],
+        ),
+    ]
+
+
+def _activity_decision_trace(
+    *,
+    question: str,
+    source_kind: str,
+    source: str,
+    source_paths: list[str] | None,
+    chart_slots: list[dict[str, Any]],
+    layout_spec: dict[str, Any] | None,
+    summary: dict[str, Any] | None,
+    fields: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    summary = summary or {}
+    layout_spec = layout_spec or {}
+    field_names = [str(field) for field in (fields or []) if field]
+    if not field_names:
+        field_names = [
+            str(slot.get("field"))
+            for slot in chart_slots
+            if isinstance(slot, dict) and slot.get("field")
+        ]
+    chart_titles = [
+        str(slot.get("title") or slot.get("id") or "chart")
+        for slot in chart_slots
+        if isinstance(slot, dict)
+    ]
+    layout_blocks = layout_spec.get("blocks") if isinstance(layout_spec.get("blocks"), list) else []
+    chart_types = [
+        str(slot.get("chartType"))
+        for slot in chart_slots
+        if isinstance(slot, dict) and slot.get("chartType")
+    ]
+    lineage = _dedupe_source_paths([str(path) for path in (source_paths or []) if path])
+    return [
+        _decision_trace_item(
+            "Interpret request",
+            "Agent decided this should be a field-matched activity dashboard because no stronger ranked or time-series graph aggregate matched the request.",
+            [
+                f"User request: {question}",
+                f"Agent decided: {_result_type_label('activity', chart_titles=chart_titles)}",
+            ],
+        ),
+        _decision_trace_item(
+            "Select data",
+            f"Selected {source or 'matched source'} from {source_kind} context using fields and aggregates matched to the prompt.",
+            [
+                f"Rows available: {summary.get('totalRecords') or summary.get('sampleRecords') or 'not provided'}",
+                f"Fields matched: {', '.join(field_names[:10]) if field_names else 'not provided'}",
+            ],
+        ),
+        _decision_trace_item(
+            "Collect lineage",
+            "Resolved original dashboard sources from graph or DuckDB lineage metadata.",
+            lineage[:8],
+        ),
+        _decision_trace_item(
+            "Choose layout",
+            f"Used the {layout_spec.get('title') or 'activity'} layout because its available metrics and chart slots matched the prompt.",
+            [
+                f"Layout blocks: {len(layout_blocks)}",
+                f"Charts selected: {', '.join(chart_titles) if chart_titles else 'none'}",
+            ],
+        ),
+        _decision_trace_item(
+            "Bind chart",
+            "Bound selected fields to the available chart types and used KPI cards for aggregate counts.",
+            [
+                f"Chart types: {', '.join(chart_types) if chart_types else 'none'}",
+                f"Chart count: {len(chart_slots)}",
+            ],
+        ),
+    ]
+
+
 def _ranked_dimension_activity_from_payload(
     aggregate: dict[str, Any],
     question: str,
@@ -651,12 +1334,18 @@ def _ranked_dimension_activity_from_payload(
     table = str(aggregate.get("duckdb_table") or "graph aggregate")
     dimension = str(aggregate.get("dimension_field") or "dimension")
     measure = str(aggregate.get("measure_field") or "measure")
+    source_paths = _aggregate_source_paths(aggregate, question, [dimension, measure])
     dimension_label = _dimension_display_name(dimension, question)
     measure_label = _measure_display_name(measure)
     top_label = str(aggregate.get("top_label") or chart_data[0].get("label") or "")
     top_value = int(aggregate.get("top_value") or chart_data[0].get("value") or 0)
     total_measure = int(aggregate.get("total_measure_values") or 0)
     total_dimensions = int(aggregate.get("distinct_dimension_values") or 0)
+    records = _ranked_sample_records_from_duckdb(aggregate, table, dimension, top_label) or [
+        {"source": table, "index": index, dimension: item.get("label"), measure: item.get("value")}
+        for index, item in enumerate(chart_data)
+    ]
+    source_samples = _source_sample_records_from_duckdb(aggregate, source_paths)
     slot_id = f"top-{_slot_safe_field(dimension)}-by-{_slot_safe_field(measure)}"
     chart_slots = [
         {
@@ -668,26 +1357,41 @@ def _ranked_dimension_activity_from_payload(
             "data": chart_data,
         }
     ]
+    decision_trace = _ranked_decision_trace(
+        question=question,
+        source_kind=source_kind,
+        table=table,
+        dimension=dimension,
+        measure=measure,
+        dimension_label=dimension_label,
+        measure_label=measure_label,
+        source_paths=source_paths,
+        chart_data=chart_data,
+        total_measure=total_measure,
+        total_dimensions=total_dimensions,
+    )
     return {
         "datasets": {
             table: {
                 "source": table,
                 "key": table,
+                "source_paths": source_paths,
+                "source_samples": source_samples,
                 "object_type": f"{source_kind}_aggregate",
                 "sampleRecords": len(chart_data),
                 "totalRecords": total_measure,
                 "isFullAggregate": True,
             }
         },
-        "records": [
-            {"source": table, "index": index, dimension: item.get("label"), measure: item.get("value")}
-            for index, item in enumerate(chart_data)
-        ],
+        "records": records,
         "chartPlan": [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots],
         "chartSlots": chart_slots,
         "charts": {slot_id: chart_data},
+        "decisionTrace": decision_trace,
         "summary": {
             "source": table,
+            "sourcePaths": source_paths,
+            "sourceSamples": source_samples,
             "sampleRecords": len(chart_data),
             "totalRecords": total_measure,
             "isFullAggregate": True,
@@ -717,11 +1421,8 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
     wants_rank = any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank"))
     if not wants_rank:
         return {}
-    db_path = getattr(store, "path", None)
-    if db_path is None:
-        return {}
-    db_path = db_path.parent / "dashboard_agent.duckdb"
-    if not db_path.exists():
+    db_path = _duckdb_database_path(store)
+    if db_path is None or not db_path.exists():
         return {}
     try:
         import duckdb
@@ -787,6 +1488,9 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
         top_value = chart_data[0]["value"]
         dimension_label = _dimension_display_name(dimension, question)
         measure_label = _measure_display_name(measure)
+        source_paths = _source_paths_for_table(con, table, question=question, fields=[dimension, measure])
+        source_samples = _source_sample_records(con, source_paths, limit_per_source=50)
+        sample_records = _ranked_sample_records(con, table, dimension, top_label, limit=12)
         slot_id = f"top-{_slot_safe_field(dimension)}-by-{_slot_safe_field(measure)}"
         chart_slots = [
             {
@@ -798,26 +1502,45 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
                 "data": chart_data,
             }
         ]
+        decision_trace = _ranked_decision_trace(
+            question=question,
+            source_kind="duckdb",
+            table=table,
+            dimension=dimension,
+            measure=measure,
+            dimension_label=dimension_label,
+            measure_label=measure_label,
+            source_paths=source_paths,
+            chart_data=chart_data,
+            total_measure=total_measure,
+            total_dimensions=total_dimensions,
+        )
         activity = {
             "datasets": {
                 table: {
                     "source": table,
                     "key": table,
+                    "source_paths": source_paths,
+                    "source_samples": source_samples,
                     "object_type": "duckdb",
                     "sampleRecords": len(chart_data),
                     "totalRecords": total_measure,
                     "isFullAggregate": True,
                 }
             },
-            "records": [
+            "records": sample_records
+            or [
                 {"source": table, "index": index, dimension: label, measure: value}
                 for index, (label, value) in enumerate(rows)
             ],
             "chartPlan": [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots],
             "chartSlots": chart_slots,
             "charts": {slot_id: chart_data},
+            "decisionTrace": decision_trace,
             "summary": {
                 "source": table,
+                "sourcePaths": source_paths,
+                "sourceSamples": source_samples,
                 "sampleRecords": len(chart_data),
                 "totalRecords": total_measure,
                 "isFullAggregate": True,
@@ -1014,6 +1737,8 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
     except Exception:
         return {}
     intent_terms = set(_intent_terms(question))
+    completion_terms = intent_terms & {"complete", "completed", "completion", "finish", "finished", "result", "status"}
+    learning_terms = intent_terms & {"content", "course", "learn", "learning", "read", "reading"}
     lowered = question.lower()
     wants_activity = "activity" in lowered or "event" in lowered
     wants_user = "user" in lowered or "learner" in lowered or "student" in lowered
@@ -1042,6 +1767,17 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
         fields = _infer_duckdb_json_fields(con, str(source_path))
+        source_fields = _duckdb_json_field_names(con, str(source_path))
+        field_match_score = sum(_field_score(field, intent_terms) for field in source_fields)
+        if field_match_score:
+            score += min(field_match_score, 10.0)
+        if completion_terms:
+            has_completion_field = any(_field_score(field, completion_terms) > 0 for field in source_fields)
+            score += 15.0 if has_completion_field else -8.0
+        if learning_terms:
+            has_learning_field = any(_field_score(field, learning_terms) > 0 for field in source_fields)
+            if has_learning_field:
+                score += 8.0
         if fields.get("timestamp"):
             score += 6.0 if wants_time else 2.0
         if fields.get("user"):
@@ -1085,12 +1821,37 @@ def _infer_duckdb_json_fields(con: Any, source_path: str) -> dict[str, str]:
         "timestamp": _choose_field(fields, ("@timestamp", "timestamp", "created_at", "created", "updated_at", "date", "time")),
         "user": _choose_field(fields, ("userID", "user_id", "userid", "username", "user", "actorID", "student_id", "learner_id")),
         "event": _choose_field(fields, ("event", "event_type", "action", "name", "verb")),
-        "category": _choose_field(fields, ("eventCategory", "event_category", "category", "type")),
+        "category": _choose_field(fields, ("eventCategory", "event_category", "category", "type", "status", "state", "result")),
         "course": _choose_field(fields, ("courseID", "course_id", "course_key", "course")),
         "app": _choose_field(fields, ("appID", "app_id", "application", "app")),
     }
     _duckdb_field_cache[source_path] = inferred
     return inferred
+
+
+def _duckdb_json_field_names(con: Any, source_path: str) -> set[str]:
+    try:
+        rows = con.execute(
+            """
+            select payload_json
+            from unified_records
+            where source_path = ?
+              and payload_json is not null
+            limit 60
+            """,
+            [source_path],
+        ).fetchall()
+    except Exception:
+        return set()
+    fields: set[str] = set()
+    for (payload_json,) in rows:
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            fields.update(str(key) for key in payload)
+    return fields
 
 
 def _choose_field(fields: set[str], preferred: tuple[str, ...]) -> str:
@@ -1458,24 +2219,45 @@ def _activity_dashboard_context(store: Any, results: list[dict[str, Any]], quest
         full_distinct_time_buckets=full_distinct_time_buckets,
         full_user_time_buckets=full_user_time_buckets,
     )
-    return {
+    chart_slots = _retitle_slots_for_prompt(question, chart_slots)
+    chart_plan = [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots]
+    source_paths = _dedupe_source_paths(
+        [
+            str(meta.get("s3_uri") or meta.get("key") or source)
+            for source, meta in dataset_meta.items()
+            if source or meta.get("s3_uri") or meta.get("key")
+        ]
+    )
+    summary = {
+        "sampleRecords": len(records),
+        "totalRecords": aggregate_meta.get("full_record_count"),
+        "isFullAggregate": bool(aggregate_meta.get("full_record_count")),
+        "distinctEvents": len(full_counts.get("event", []))
+        or len({record.get("event") for record in records if record.get("event")}),
+        "distinctCourses": len(full_counts.get("courseID", []))
+        or len({record.get("courseID") for record in records if record.get("courseID")}),
+        "distinctUsers": len(full_counts.get("userID", []))
+        or len({record.get("userID") for record in records if record.get("userID")}),
+    }
+    activity = {
         "datasets": dataset_meta,
         "records": records,
         "chartPlan": chart_plan,
         "chartSlots": chart_slots,
         "charts": {slot["id"]: slot["data"] for slot in chart_slots},
-        "summary": {
-            "sampleRecords": len(records),
-            "totalRecords": aggregate_meta.get("full_record_count"),
-            "isFullAggregate": bool(aggregate_meta.get("full_record_count")),
-            "distinctEvents": len(full_counts.get("event", []))
-            or len({record.get("event") for record in records if record.get("event")}),
-            "distinctCourses": len(full_counts.get("courseID", []))
-            or len({record.get("courseID") for record in records if record.get("courseID")}),
-            "distinctUsers": len(full_counts.get("userID", []))
-            or len({record.get("userID") for record in records if record.get("userID")}),
-        },
+        "summary": summary,
     }
+    activity["layoutSpec"] = _activity_layout_spec(question, activity)
+    activity["decisionTrace"] = _activity_decision_trace(
+        question=question,
+        source_kind="graph",
+        source=", ".join(sources[:3]),
+        source_paths=source_paths,
+        chart_slots=chart_slots,
+        layout_spec=activity["layoutSpec"],
+        summary=summary,
+    )
+    return activity
 
 
 def _design_generic_chart_plan(
@@ -1492,24 +2274,27 @@ def _design_generic_chart_plan(
         return []
 
     intent_terms = set(_intent_terms(question))
+    lowered = question.lower()
+    wants_time = "time" in lowered or "trend" in lowered or "overtime" in lowered or "over time" in lowered
     plan: list[dict[str, Any]] = []
 
-    distinct_fields = _rank_fields(full_distinct_time_buckets, intent_terms)
-    for field in distinct_fields[:3]:
-        field_label = _humanize_field(field)
-        plan.append(
-            {
-                "id": f"distinctTime-{_slot_safe_field(field)}",
-                "title": f"{field_label} over time",
-                "chartType": "line",
-                "field": f"{field}@time",
-                "sourceField": field,
-                "aggregate": "distinct_time",
-                "reason": "A line chart shows distinct values for this matched field by time bucket.",
-            }
-        )
+    if wants_time:
+        distinct_fields = _rank_fields(full_distinct_time_buckets, intent_terms)
+        for field in distinct_fields[:3]:
+            field_label = _humanize_field(field)
+            plan.append(
+                {
+                    "id": f"distinctTime-{_slot_safe_field(field)}",
+                    "title": f"{field_label} over time",
+                    "chartType": "line",
+                    "field": f"{field}@time",
+                    "sourceField": field,
+                    "aggregate": "distinct_time",
+                    "reason": "A line chart shows distinct values for this matched field by time bucket.",
+                }
+            )
 
-    if full_time_buckets:
+    if wants_time and full_time_buckets:
         plan.append(
             {
                 "id": "activityTimeline",
@@ -1579,7 +2364,9 @@ def _design_activity_chart_plan(
     if full_counts:
         candidate_fields.update(full_counts)
     plan: list[dict[str, Any]] = []
-    if full_user_time_buckets:
+    lowered = question.lower()
+    wants_time = "time" in lowered or "trend" in lowered or "overtime" in lowered or "over time" in lowered
+    if wants_time and full_user_time_buckets:
         plan.append(
             {
                 "id": "userTimeline",
@@ -1589,7 +2376,7 @@ def _design_activity_chart_plan(
                 "reason": "A line chart fits distinct user counts by timestamp bucket.",
             }
         )
-    if full_time_buckets or _time_buckets(records):
+    if wants_time and (full_time_buckets or _time_buckets(records)):
         plan.append(
             {
                 "id": "activityTimeline",
@@ -1749,6 +2536,7 @@ def _fallback_activity_layout_spec(
     lowered = question.lower()
     wants_user = "user" in lowered or "learner" in lowered or "student" in lowered
     wants_time = "time" in lowered or "trend" in lowered or "overtime" in lowered or "over time" in lowered
+    wants_count = "number" in lowered or "count" in lowered or "how many" in lowered or "total" in lowered
     wants_course = "course" in lowered
     wants_event = "event" in lowered or "activity" in lowered or "click" in lowered
 
@@ -1757,6 +2545,14 @@ def _fallback_activity_layout_spec(
 
     def chart(slot_id: str, span: int = 1) -> dict[str, Any]:
         return {"type": "chart", "slotId": slot_id, "span": span}
+
+    def dynamic_slots(*excluded: str) -> list[str]:
+        excluded_ids = {"userTimeline", "activityTimeline", *excluded}
+        intent_terms = set(_intent_terms(question))
+        return sorted(
+            (slot_id for slot_id in available_slots if slot_id not in excluded_ids),
+            key=lambda slot_id: (-_field_score(slot_id, intent_terms), slot_id),
+        )
 
     blocks: list[dict[str, Any]] = []
     title = "Activity dashboard"
@@ -1776,36 +2572,52 @@ def _fallback_activity_layout_spec(
         if "users" in available_slots:
             blocks.append(chart("users", 2 if "userTimeline" not in available_slots else 1))
     elif wants_user:
-        title = "User activity"
+        title = "User count" if wants_count else "User activity"
         for metric_id in ("distinctUsers", "totalRecords"):
             if metric_id in available_metrics:
                 blocks.append(metric(metric_id))
+        for slot_id in dynamic_slots("users"):
+            blocks.append(chart(slot_id, 2))
         if "users" in available_slots:
             blocks.append(chart("users", 2))
-        if "activityTimeline" in available_slots:
+        if wants_time and "activityTimeline" in available_slots:
             blocks.append(chart("activityTimeline", 2))
     elif wants_course:
         title = "Course activity"
         for metric_id in ("distinctCourses", "totalRecords"):
             if metric_id in available_metrics:
                 blocks.append(metric(metric_id))
+        for slot_id in dynamic_slots("courses"):
+            blocks.append(chart(slot_id, 2))
         if "courses" in available_slots:
             blocks.append(chart("courses", 2))
-        if "activityTimeline" in available_slots:
+        if wants_time and "activityTimeline" in available_slots:
             blocks.append(chart("activityTimeline", 2))
     elif wants_event:
         title = "Activity events"
         for metric_id in ("totalRecords", "distinctEvents"):
             if metric_id in available_metrics:
                 blocks.append(metric(metric_id))
-        for slot_id in ("activityTimeline", "events", "categories"):
+        for slot_id in (*dynamic_slots("events", "categories"), "events", "categories"):
             if slot_id in available_slots:
-                blocks.append(chart(slot_id, 2 if slot_id == "activityTimeline" else 1))
+                blocks.append(chart(slot_id, 2 if slot_id.startswith("fieldCounts-") else 1))
+        if wants_time and "activityTimeline" in available_slots:
+            blocks.append(chart("activityTimeline", 2))
     else:
         for metric_id in ("totalRecords", "distinctEvents", "distinctCourses", "distinctUsers"):
             if metric_id in available_metrics:
                 blocks.append(metric(metric_id))
-        for slot_id in ("userTimeline", "activityTimeline", "events", "courses", "categories", "users", "apps"):
+        general_slots = [
+            *dynamic_slots("events", "courses", "categories", "users", "apps"),
+            "events",
+            "courses",
+            "categories",
+            "users",
+            "apps",
+        ]
+        if wants_time:
+            general_slots = ["userTimeline", "activityTimeline", *general_slots]
+        for slot_id in general_slots:
             if slot_id in available_slots:
                 blocks.append(chart(slot_id, 2 if slot_id in {"userTimeline", "activityTimeline"} else 1))
 

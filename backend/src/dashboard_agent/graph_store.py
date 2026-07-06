@@ -13,6 +13,8 @@ from .s3_source import JsonObject
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-\.]+")
+HUMAN_LABEL_RE = re.compile(r"([a-z0-9])([A-Z])")
+HUMAN_KEEP_ALL_CAPS = {"API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"}
 MAX_RUNTIME_GRAPH_NODES = 5_000
 MAX_RUNTIME_GRAPH_EDGES = 10_000
 MAX_LOAD_GRAPH_BYTES = 50 * 1024 * 1024
@@ -86,7 +88,7 @@ class JsonGraphStore:
                 type="dataset",
                 label=source.key,
                 path=source.key,
-                etag=source.etag,
+                ETAG=source.ETAG,
                 object_type=source.object_type,
                 size=source.size,
                 text=f"S3 {source.object_type} dataset {source.key}",
@@ -232,7 +234,7 @@ class JsonGraphStore:
     def _result_item(self, node_id: str, attrs: dict[str, Any], score: float) -> dict[str, Any]:
         return {
             "id": node_id,
-            "label": attrs.get("label") or attrs.get("name") or node_id,
+            "label": self._human_label(attrs.get("label") or attrs.get("name") or node_id),
             "path": attrs.get("path") or attrs.get("file") or attrs.get("source_file") or attrs.get("source"),
             "source": attrs.get("source") or attrs.get("source_file") or attrs.get("path") or attrs.get("file"),
             "value": attrs.get("value"),
@@ -246,7 +248,7 @@ class JsonGraphStore:
         labels: list[str] = []
         for neighbor in list(self.graph.neighbors(node_id))[:limit]:
             attrs = self.graph.nodes[neighbor]
-            labels.append(str(attrs.get("label") or attrs.get("name") or neighbor))
+            labels.append(self._human_label(attrs.get("label") or attrs.get("name") or neighbor))
         return labels
 
     def status(self) -> dict[str, Any]:
@@ -384,3 +386,30 @@ class JsonGraphStore:
             if len(term) > 3 and term.endswith("s"):
                 terms.add(term[:-1])
         return terms
+
+    @staticmethod
+    def _human_label(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "Unknown"
+        text = text.replace("\\", "/").rsplit("/", 1)[-1]
+        text = re.sub(r"^\$\.?", "", text)
+        text = re.sub(r"\.(json|csv|tsv|parquet|ndjson|jsonl|sql|db|duckdb|txt)$", "", text, flags=re.IGNORECASE)
+        text = HUMAN_LABEL_RE.sub(r"\1 \2", text)
+        text = re.sub(r"[_\-.]+", " ", text)
+        words: list[str] = []
+        for raw_word in text.split():
+            word = raw_word.strip()
+            if not word:
+                continue
+            if word.upper() in HUMAN_KEEP_ALL_CAPS:
+                words.append(word.upper() if len(word) <= 4 else word.title())
+                continue
+            if word.isupper() and len(word) <= 4:
+                words.append(word)
+                continue
+            if word.isdigit():
+                words.append(word)
+                continue
+            words.append(word[:1].upper() + word[1:].lower())
+        return " ".join(words) if words else "Unknown"
