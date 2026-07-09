@@ -420,8 +420,15 @@ function SourceDisclosure({
   );
 }
 
-function ReasoningDisclosure({ trace }: { trace?: DecisionTraceItem[] }) {
+function ReasoningDisclosure({
+  trace,
+  samples,
+}: {
+  trace?: DecisionTraceItem[];
+  samples?: unknown[];
+}) {
   const [isOpen, setIsOpen] = useState(false);
+  const [sampleModal, setSampleModal] = useState<SourceModalState>(null);
   const items = (trace ?? []).filter((item) => item.step || item.detail);
   if (!items.length) return null;
 
@@ -448,11 +455,27 @@ function ReasoningDisclosure({ trace }: { trace?: DecisionTraceItem[] }) {
                 <span className="block break-words">{item.detail}</span>
                 {item.evidence?.length ? (
                   <span className="mt-1 flex flex-wrap gap-1.5">
-                    {item.evidence.slice(0, 8).map((entry) => (
-                      <span key={entry} className="max-w-full rounded border bg-background px-1.5 py-0.5 text-foreground/60">
-                        {entry}
-                      </span>
-                    ))}
+                    {item.evidence.slice(0, 8).map((entry) => {
+                      const sourceSamples = sampleRowsForSource(samples, entry);
+                      if (!sourceSamples.length) {
+                        return (
+                          <span key={entry} className="max-w-full rounded border bg-background px-1.5 py-0.5 text-foreground/60">
+                            {entry}
+                          </span>
+                        );
+                      }
+                      return (
+                        <button
+                          key={entry}
+                          type="button"
+                          onClick={() => setSampleModal({ title: entry, samples: sourceSamples })}
+                          className="max-w-full rounded border bg-background px-1.5 py-0.5 text-left text-foreground/70 transition hover:border-foreground/30 hover:text-foreground"
+                          title={`Show sample data for ${entry}`}
+                        >
+                          <span className="block truncate">{entry}</span>
+                        </button>
+                      );
+                    })}
                   </span>
                 ) : null}
               </span>
@@ -460,6 +483,7 @@ function ReasoningDisclosure({ trace }: { trace?: DecisionTraceItem[] }) {
           ))}
         </ol>
       ) : null}
+      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} />
     </div>
   );
 }
@@ -505,6 +529,23 @@ function activitySourceItems(activity?: ActivityDashboardPayload): SourceDisclos
     { label: "Fields", value: chartPlan.map((slot) => humanLabel(slot.field)).filter(Boolean) },
     { label: "Query plan", value: chartPlan.map((slot) => slot.reason).filter(Boolean).join(" ") },
   ];
+}
+
+function activitySourceSampleRows(activity?: ActivityDashboardPayload): unknown[] {
+  if (!activity) return [];
+  const datasetValues = Array.isArray(activity.datasets)
+    ? activity.datasets
+    : Object.values(activity.datasets ?? {});
+  const summary = activity.summary ?? {};
+  const sourceSamples = {
+    ...(summary.sourceSamples ?? {}),
+    ...datasetValues.reduce<Record<string, unknown[]>>((samples, dataset) => {
+      return { ...samples, ...(dataset.source_samples ?? {}) };
+    }, {}),
+  };
+  return Object.entries(sourceSamples).flatMap(([source, rows]) =>
+    (rows ?? []).map((row) => (row && typeof row === "object" ? { ...(row as Record<string, unknown>), source } : { source, value: row })),
+  );
 }
 
 function graphSourceItems(payload: GraphDashboardWidgetPayload): SourceDisclosureItem[] {
@@ -966,6 +1007,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     return <ActivityDashboardSection activity={activity} />;
   }
 
+  const sourceItems = activitySourceItems(activity);
+  const sourceSampleRows = activitySourceSampleRows(activity);
   const records = activity?.records ?? [];
   const charts = activity?.charts ?? {};
   const chartSlots =
@@ -1090,8 +1133,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
           {layoutSpec.subtitle ? (
             <p className="max-w-3xl text-sm text-muted-foreground">{layoutSpec.subtitle}</p>
           ) : null}
-          <SourceDisclosure items={activitySourceItems(activity)} />
-          <ReasoningDisclosure trace={activity?.decisionTrace} />
+          <SourceDisclosure items={sourceItems} />
+          <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} />
         </div>
       </div>
 
@@ -1141,6 +1184,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
 }
 
 function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPayload }) {
+  const sourceItems = activitySourceItems(activity);
+  const sourceSampleRows = activitySourceSampleRows(activity);
   const records = activity?.records ?? [];
   const charts = activity?.charts ?? {};
   const chartSlots =
@@ -1220,8 +1265,8 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
                 ? "Charts summarize the full file scan; table rows are a preview."
                 : "Values summarize retrieved sample records, not the full 11GB file."}
             </p>
-            <SourceDisclosure items={activitySourceItems(activity)} />
-            <ReasoningDisclosure trace={activity?.decisionTrace} />
+            <SourceDisclosure items={sourceItems} />
+            <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} />
             </div>
           <div className="flex flex-wrap gap-2 text-xs">
             {sourceMeta?.object_type ? (
