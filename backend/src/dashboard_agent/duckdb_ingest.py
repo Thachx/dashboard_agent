@@ -10,6 +10,9 @@ from dashboard_agent.graph_store import JsonGraphStore
 from dashboard_agent.s3_source import JsonObject
 
 
+SOURCE_EXTENSION_RE = re.compile(r"\.(json|csv|tsv|parquet|ndjson|jsonl|sql|db|duckdb|txt)$", re.IGNORECASE)
+
+
 def ingest_duckdb_database(
     store: JsonGraphStore,
     database_path: str | Path,
@@ -172,19 +175,23 @@ def _unified_record_objects(
 
     for source_path, source_format, source_table, record_count in summaries:
         source_path = str(source_path)
+        source_label = _source_label(source_path)
         payloads = samples_by_source.get(source_path, [])
         parsed_samples = [_parse_payload(payload) for payload in payloads]
         fields = _field_summary(parsed_samples, max_fields=max_fields_per_source)
+        field_names = [str(field.get("name")) for field in fields if isinstance(field, dict) and field.get("name")]
         value = {
             "duckdb_database": str(db_path),
             "duckdb_table": table,
             "source_path": source_path,
+            "source_label": source_label,
             "source_format": source_format,
             "source_table": source_table,
             "record_count": int(record_count),
             "sample_records": parsed_samples,
             "sample_fields": fields,
             "sample_field_count": len(fields),
+            "semantic_terms": _semantic_terms(table, source_path, source_label, source_table or "", *field_names),
         }
         yield JsonObject(
             key=f"duckdb/{table}/{source_path}",
@@ -293,11 +300,14 @@ def _ranked_dimension_payload(
         return {}
     chart_data = [{"label": str(label), "value": int(value)} for label, value in rows]
     top = chart_data[0]
+    source_paths = _source_paths_for_table(con, table, fields=[dimension, measure])
+    source_labels = [_source_label(path) for path in source_paths]
     return {
         "aggregate_kind": "ranked_dimension",
         "duckdb_database": str(db_path),
         "duckdb_table": table,
-        "source_paths": _source_paths_for_table(con, table, fields=[dimension, measure]),
+        "source_paths": source_paths,
+        "source_labels": source_labels,
         "dimension_field": dimension,
         "measure_field": measure,
         "dimension_label": _display_name(dimension),
@@ -307,7 +317,7 @@ def _ranked_dimension_payload(
         "top_label": top["label"],
         "top_value": top["value"],
         "chart_data": chart_data,
-        "semantic_terms": _semantic_terms(table, dimension, measure),
+        "semantic_terms": _semantic_terms(table, dimension, measure, *source_paths, *source_labels),
     }
 
 
@@ -367,17 +377,20 @@ def _activity_time_series_aggregate_object(con: Any, db_path: Path) -> JsonObjec
         return None
     records_data = [{"label": str(label), "value": int(records)} for label, records, _users in rows]
     users_data = [{"label": str(label), "value": int(users)} for label, _records, users in rows]
+    source_paths = _source_paths_for_table(con, "dashboard_agent_activity_hourly_cache", fields=["time", "records", "users"])
+    source_labels = [_source_label(path) for path in source_paths]
     value = {
         "aggregate_kind": "time_series",
         "duckdb_database": str(db_path),
         "duckdb_table": "dashboard_agent_activity_hourly_cache",
-        "source_paths": _source_paths_for_table(con, "dashboard_agent_activity_hourly_cache", fields=["time", "records", "users"]),
+        "source_paths": source_paths,
+        "source_labels": source_labels,
         "time_field": "label",
         "records_series": records_data,
         "users_series": users_data,
         "total_records": int(totals[0] or 0),
         "total_users": int(totals[1] or 0),
-        "semantic_terms": ["activity", "event", "row", "record", "user", "users", "time", "trend", "over_time"],
+        "semantic_terms": sorted(set(["activity", "event", "row", "record", "user", "users", "time", "trend", "over_time", *_semantic_terms(*source_paths, *source_labels)])),
     }
     return JsonObject(
         key="duckdb/aggregate/time_series/activity_users_records",
@@ -417,7 +430,7 @@ def _source_paths_for_table(con: Any, table: str, *, fields: list[str] | None = 
         if paths:
             return paths
 
-    columns = _table_columns(con, table)
+    columns = _table_column_names(con, table)
     source_columns = [column for column in columns if column == "source_path" or column.endswith("_source_path")]
     if source_columns:
         selects = [
@@ -432,7 +445,7 @@ def _source_paths_for_table(con: Any, table: str, *, fields: list[str] | None = 
     return _infer_source_paths_for_table(con, table, columns, fields=fields or [])
 
 
-def _table_columns(con: Any, table: str) -> list[str]:
+def _table_column_names(con: Any, table: str) -> list[str]:
     try:
         return [str(row[1]) for row in con.execute(f"pragma table_info({_quote_identifier(table)})").fetchall()]
     except Exception:
@@ -460,7 +473,8 @@ def _infer_source_paths_for_table(con: Any, table: str, columns: list[str], *, f
     for source_path, source_table, records in rows:
         source_path = str(source_path)
         lineage_path = _lineage_source_path(source_path)
-        source_terms = _term_set(f"{source_path} {source_table or ''}")
+        source_label = _source_label(source_path)
+        source_terms = _term_set(f"{source_path} {source_label} {source_table or ''}")
         score = len(target_terms & source_terms)
         if score > 0:
             previous = scored_by_path.get(lineage_path)
@@ -541,6 +555,20 @@ def _semantic_terms(*values: str) -> list[str]:
         terms.update({"subject", "class"})
     terms.update({"top", "most", "highest", "rank"})
     return sorted(terms)
+
+
+def _source_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Unknown Source"
+    text = re.sub(r"^s3://[^/]+/", "", text.replace("\\", "/"))
+    text = re.sub(r"^duckdb/[^/]+/", "", text)
+    parts = [part for part in text.split("/") if part]
+    base = parts[-1] if parts else text
+    parent = parts[-2] if len(parts) > 1 else ""
+    label = _display_name(SOURCE_EXTENSION_RE.sub("", base))
+    parent_label = _display_name(parent) if parent and parent.lower() not in {"data", "json", "parquet", "duckdb"} else ""
+    return f"{parent_label} - {label}" if parent_label and parent_label not in label else label
 
 
 def _generic_table_object(

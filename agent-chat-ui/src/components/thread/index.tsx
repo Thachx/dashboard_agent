@@ -7,16 +7,12 @@ import { Button } from "../ui/button";
 import { Label } from "../ui/label";
 import { Switch } from "../ui/switch";
 import type {
-  Checkpoint,
   Message,
   Thread as LangGraphThread,
 } from "@langchain/langgraph-sdk";
 import { AssistantMessage, AssistantMessageError, AssistantMessageLoading } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
-import {
-  DO_NOT_RENDER_ID_PREFIX,
-  ensureToolCallsHaveResponses,
-} from "@/lib/ensure-tool-responses";
+import { DO_NOT_RENDER_ID_PREFIX } from "@/lib/ensure-tool-responses";
 import { TooltipIconButton } from "./tooltip-icon-button";
 import {
   ArrowDown,
@@ -410,7 +406,6 @@ export function Thread() {
       ] as Message["content"],
     };
 
-    const toolMessages = ensureToolCallsHaveResponses(messages);
     const attachedFiles = contentBlocks.map((block, index) => {
       const metadata = block.metadata ?? {};
       const name =
@@ -482,7 +477,7 @@ export function Thread() {
     }
 
     stream.submit(
-      { messages: [...toolMessages, newHumanMessage], context },
+      { messages: [newHumanMessage], context },
       {
         streamMode: ["values"],
         streamSubgraphs: false,
@@ -499,7 +494,6 @@ export function Thread() {
           context,
           messages: [
             ...(prev.messages ?? []),
-            ...toolMessages,
             newHumanMessage,
           ],
         }),
@@ -510,26 +504,51 @@ export function Thread() {
     setContentBlocks([]);
   };
 
-  const handleRegenerate = (
-    parentCheckpoint: Checkpoint | null | undefined,
-  ) => {
+  const handleRegenerate = (humanPrompt: string) => {
+    const trimmedPrompt = humanPrompt.trim();
+    if (!trimmedPrompt) {
+      toast.error("Could not find the prompt to refresh.", {
+        duration: 3000,
+      });
+      return;
+    }
     const resolvedUserId = userIdRef.current || userId || "unknown";
-    stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
-      streamMode: ["values"],
-      streamSubgraphs: false,
-      streamResumable: false,
-      config: {
-        configurable: {
-          web_search_enabled: false,
+    const newHumanMessage: Message = {
+      id: uuidv4(),
+      type: "human",
+      content: [{ type: "text", text: trimmedPrompt }] as Message["content"],
+    };
+    const context = {
+      web_search_enabled: false,
+      manual_sql_enabled: false,
+    };
+    stream.submit(
+      { messages: [newHumanMessage], context },
+      {
+        streamMode: ["values"],
+        streamSubgraphs: false,
+        streamResumable: false,
+        config: {
+          configurable: {
+            web_search_enabled: false,
+          },
         },
+        metadata: {
+          guest_id: ensureGuestId(),
+          web_search_enabled: false,
+          user_id: resolvedUserId,
+          manual_sql_enabled: false,
+        },
+        optimisticValues: (prev) => ({
+          ...prev,
+          context,
+          messages: [
+            ...(prev.messages ?? []),
+            newHumanMessage,
+          ],
+        }),
       },
-      metadata: {
-        guest_id: ensureGuestId(),
-        web_search_enabled: false,
-        user_id: resolvedUserId,
-      },
-    });
+    );
   };
 
   const chatStarted = !!threadId || !!displayMessages.length;

@@ -2,7 +2,6 @@ import { parsePartialJson } from "@langchain/core/output_parsers";
 import { useStreamContext } from "@/providers/Stream";
 import {
   AIMessage,
-  Checkpoint,
   Message,
   ToolMessage,
 } from "@langchain/langgraph-sdk";
@@ -241,7 +240,7 @@ export function AssistantMessage({
 }: {
   message: Message | undefined;
   isLoading: boolean;
-  handleRegenerate: (parentCheckpoint: Checkpoint | null | undefined) => void;
+  handleRegenerate: (humanPrompt: string) => void;
   threadMessages?: Message[];
 }) {
   const content = message?.content ?? [];
@@ -274,7 +273,6 @@ export function AssistantMessage({
   );
   const meta = message ? thread.getMessagesMetadata(message) : undefined;
 
-  const parentCheckpoint = meta?.firstSeenState?.parent_checkpoint;
   const anthropicStreamedToolCalls = Array.isArray(content)
     ? parseAnthropicStreamedToolCalls(content)
     : undefined;
@@ -333,7 +331,6 @@ export function AssistantMessage({
     }
     return -1;
   }, [messageIndex, threadMessages]);
-
   const turnStartIndex = Math.max(previousHumanIndex + 1, 0);
   const turnEndIndex =
     nextHumanIndex === -1 ? threadMessages.length : nextHumanIndex;
@@ -594,7 +591,7 @@ export function AssistantMessage({
                 content={contentString}
                 isLoading={isLoading}
                 isAiMessage={true}
-                handleRegenerate={() => handleRegenerate(parentCheckpoint)}
+                handleRegenerate={() => handleRegenerate(previousHumanIndex === -1 ? "" : getContentString(threadMessages[previousHumanIndex].content ?? []))}
               />
             </div>
           </>

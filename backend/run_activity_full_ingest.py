@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
             "Example: ae-activity-data-stream.json"
         ),
     )
-    parser.add_argument("--graph-path", default=str(DEFAULT_GRAPH_PATH), help="Output graph JSON path.")
+    parser.add_argument("--graph-path", default=os.getenv("GRAPH_PATH", str(DEFAULT_GRAPH_PATH)), help="Output graph JSON path.")
     parser.add_argument("--duckdb-path", default=str(DEFAULT_DUCKDB_PATH), help="DuckDB database path when --source duckdb.")
     parser.add_argument("--duckdb-table", default="unified_records", help="DuckDB table to ingest when --source duckdb.")
     parser.add_argument("--duckdb-sample-records", type=int, default=3, help="Sample records per DuckDB source file/table.")

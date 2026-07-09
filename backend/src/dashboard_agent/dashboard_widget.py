@@ -55,6 +55,7 @@ def dataset_summaries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     datasets: dict[str, dict[str, Any]] = {}
     for item in results[:16]:
         source = str(item.get("source") or item.get("path") or item.get("id") or "")
+        source_label = str(item.get("sourceLabel") or item.get("fileLabel") or human_label(source))
         dataset_key = _dataset_key(source)
         if not dataset_key:
             continue
@@ -62,7 +63,8 @@ def dataset_summaries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             dataset_key,
             {
                 "key": dataset_key,
-                "label": human_label(dataset_key),
+                "label": source_label,
+                "sourceLabel": source_label,
                 "score": 0,
                 "matchedFields": [],
             },

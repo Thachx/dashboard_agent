@@ -29,14 +29,24 @@ SAMPLE_FIELD_RE = re.compile(r"^\$\.sample_records\[(\d+)\]\.(.+)$")
 HUMAN_LABEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 HUMAN_KEEP_ALL_CAPS = {"API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"}
 INTENT_SYNONYMS = {
-    "finish": {"complete", "completed", "completion", "status", "result"},
-    "finished": {"complete", "completed", "completion", "status", "result"},
-    "complete": {"finished", "completion", "status", "result"},
-    "completed": {"finished", "complete", "completion", "status", "result"},
+    "finish": {"pass", "passed", "complete", "completed", "completion", "status", "result"},
+    "finished": {"pass", "passed", "complete", "completed", "completion", "status", "result"},
+    "complete": {"pass", "passed", "finished", "completion", "status", "result"},
+    "completed": {"pass", "passed", "finished", "complete", "completion", "status", "result"},
+    "pass": {"passed", "complete", "completed", "finish", "finished", "status"},
+    "passed": {"pass", "complete", "completed", "finish", "finished", "status"},
     "read": {"reading", "learn", "learning", "content", "course"},
     "reading": {"read", "learn", "learning", "content", "course"},
     "learn": {"learning", "read", "reading", "course"},
     "learning": {"learn", "read", "reading", "course", "status"},
+    "education": {"level", "grade"},
+    "level": {"education", "grade"},
+    "teacher": {"instructor", "faculty"},
+    "instructor": {"teacher", "faculty"},
+    "faculty": {"teacher", "instructor"},
+    "institute": {"institution", "school", "organization", "name"},
+    "institution": {"institute", "school", "organization", "name"},
+    "school": {"institute", "institution", "organization", "name"},
 }
 DASHBOARD_BUILDING_INSTRUCTIONS = (
     "Build dashboards for the user's data domain, not for graph internals. "
@@ -120,11 +130,27 @@ def _has_loaded_graph_context(store: Any) -> bool:
     )
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
 def _last_question(state: AgentState) -> str:
     for message in reversed(state.get("messages", [])):
         if getattr(message, "type", "") == "human":
             content = getattr(message, "content", "")
-            return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            return _message_text(content)
     return ""
 
 
@@ -337,6 +363,81 @@ def _intent_terms(text: str) -> list[str]:
     return expanded
 
 
+QUERY_DIMENSION_STOP_TERMS = {
+    "activity",
+    "all",
+    "ask",
+    "breakdown",
+    "chart",
+    "compare",
+    "complete",
+    "completed",
+    "count",
+    "dashboard",
+    "distribution",
+    "finish",
+    "finished",
+    "graph",
+    "highest",
+    "largest",
+    "learn",
+    "learning",
+    "many",
+    "max",
+    "most",
+    "number",
+    "pass",
+    "passed",
+    "rank",
+    "reading",
+    "result",
+    "show",
+    "status",
+    "total",
+    "user",
+    "users",
+    "learner",
+    "learners",
+    "student",
+    "students",
+    "value",
+    "values",
+}
+
+
+def _query_dimension_phrases(question: str) -> list[str]:
+    lowered = f" {question.lower()} "
+    phrase_patterns = [
+        r"\b(?:by|per|grouped by|group by|split by|breakdown by|compare by)\s+([a-z0-9 _-]+)",
+        r"\bdistribution of\s+([a-z0-9 _-]+)",
+        r"\b(?:top|most|highest|largest)\s+([a-z0-9 _-]+?)\s+by\b",
+    ]
+    phrases: list[str] = []
+    for pattern in phrase_patterns:
+        for match in re.finditer(pattern, lowered):
+            phrase = re.split(
+                r"\b(?:after|and|for|from|having|that|to|where|when|which|who|with)\b",
+                match.group(1),
+                maxsplit=1,
+            )[0]
+            phrase = re.sub(r"\b(?:user|users|student|students|learner|learners|number|count|total)\b", " ", phrase)
+            phrase = re.sub(r"[^a-z0-9 _-]+", " ", phrase)
+            phrase = re.sub(r"\s+", " ", phrase).strip()
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+    return phrases
+
+
+def _query_dimension_terms(question: str) -> set[str]:
+    terms: set[str] = set()
+    for phrase in _query_dimension_phrases(question):
+        terms.update(_intent_terms(phrase))
+    if terms:
+        return terms - QUERY_DIMENSION_STOP_TERMS
+    fallback = set(_intent_terms(question)) - QUERY_DIMENSION_STOP_TERMS
+    return fallback
+
+
 def _field_terms(field: str) -> set[str]:
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", field)
     return set(re.findall(r"[a-z0-9]+", normalized.lower()))
@@ -352,6 +453,190 @@ def _field_score(field: str, intent_terms: set[str]) -> float:
         if term in field_lower:
             score += 1.0
     return score
+
+
+def _dimension_field_score(field: str, question: str, intent_terms: set[str] | None = None) -> float:
+    intent_terms = intent_terms or set(_intent_terms(question))
+    score = _field_score(field, intent_terms)
+    focus_terms = _query_dimension_terms(question)
+    if focus_terms:
+        field_terms = _field_terms(field)
+        focus_overlap = field_terms & focus_terms
+        score += float(len(focus_overlap) * 10)
+        field_text = " ".join(re.findall(r"[a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", field).lower()))
+        for phrase in _query_dimension_phrases(question):
+            phrase_terms = set(_intent_terms(phrase))
+            if phrase_terms and phrase_terms <= (field_terms | focus_terms) and phrase_terms & field_terms:
+                score += float(len(phrase_terms & field_terms) * 6)
+            phrase_text = " ".join(re.findall(r"[a-z0-9]+", phrase.lower()))
+            if phrase_text and phrase_text in field_text:
+                score += 20.0
+    return score
+
+
+def _query_filter_intent_terms(question: str) -> set[str]:
+    lowered = question.lower()
+    raw_terms = set(re.findall(r"[a-z0-9]+", lowered))
+    terms = set(_intent_terms(question))
+    filter_terms = {
+        "active",
+        "certificate",
+        "certified",
+        "complete",
+        "completed",
+        "completion",
+        "finish",
+        "finished",
+        "inactive",
+        "pass",
+        "passed",
+        "result",
+    }
+    if "distribution" in lowered and "pass" in raw_terms and not (raw_terms & {"passed", "finish", "finished", "complete", "completed"}):
+        terms -= {"pass", "passed", "complete", "completed", "finish", "finished"}
+    return terms & filter_terms
+
+
+def _needs_duckdb_filter(question: str) -> bool:
+    return bool(_query_filter_intent_terms(question))
+
+
+def _should_show_unfiltered_distribution(question: str, field: str) -> bool:
+    field_terms = _field_terms(field)
+    filter_terms = _query_filter_intent_terms(question)
+    if filter_terms and field_terms & {"status", "result", "pass", "passed", "complete", "completed", "certificate", "learning"}:
+        return True
+    lowered = question.lower()
+    wants_distribution = any(term in lowered for term in ("distribution", "breakdown", "split", "compare", "group"))
+    return wants_distribution and _field_score(field, set(_intent_terms(question))) > 0
+
+
+def _chart_type_for_count_field(field: str, rows: list[dict[str, Any]], question: str) -> str:
+    if len(rows) <= 1:
+        return "stat"
+    lowered = question.lower()
+    field_terms = _field_terms(field)
+    wants_composition = any(term in lowered for term in ("composition", "mix", "percent", "percentage", "proportion", "share"))
+    wants_distribution = any(term in lowered for term in ("distribution", "breakdown", "split"))
+    label_lengths = [len(str(row.get("label") or "")) for row in rows[:8]]
+    max_label_length = max(label_lengths or [0])
+    row_count = len(rows)
+    if row_count <= 6 and (wants_composition or wants_distribution or field_terms & {"status", "category", "type"}):
+        return "donut"
+    if row_count >= 10 and (wants_composition or "top" in lowered or "most" in lowered):
+        return "treemap"
+    if max_label_length <= 18 and row_count <= 8:
+        return "column"
+    return "horizontal_bar"
+
+
+def _ranked_chart_type_for_dimension(dimension: str, rows: list[dict[str, Any]], question: str) -> str:
+    chart_type = _chart_type_for_count_field(dimension, rows, question)
+    if chart_type == "donut" and not any(term in question.lower() for term in ("composition", "mix", "percent", "percentage", "proportion", "share")):
+        return "column"
+    return chart_type if chart_type in {"column", "treemap", "horizontal_bar"} else "horizontal_bar"
+
+
+def _ranked_filter_sql(con: Any, table: str, question: str) -> tuple[str, list[Any], list[str]]:
+    filter_terms = _query_filter_intent_terms(question)
+    if not filter_terms:
+        return "", [], []
+    try:
+        columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return "", [], []
+    clauses: list[str] = []
+    params: list[Any] = []
+    labels: list[str] = []
+    completion_terms = filter_terms & {"complete", "completed", "completion", "finish", "finished", "pass", "passed", "status", "result"}
+    active_terms = filter_terms & {"active", "inactive"}
+    for column in columns:
+        column_terms = _field_terms(column)
+        column_expr = _duckdb_quote_identifier(column)
+        lowered = column.lower()
+        if completion_terms and column_terms & {"status", "result", "learning"}:
+            try:
+                values = con.execute(
+                    f"""
+                    select distinct lower(cast({column_expr} as varchar)) as value
+                    from {_duckdb_quote_identifier(table)}
+                    where {column_expr} is not null
+                      and cast({column_expr} as varchar) <> ''
+                    limit 100
+                    """
+                ).fetchall()
+            except Exception:
+                values = []
+            matched_values = [
+                str(value)
+                for (value,) in values
+                if value is not None and (_field_terms(str(value)) & completion_terms)
+            ]
+            if matched_values:
+                placeholders = ", ".join("?" for _ in matched_values)
+                clauses.append(f"lower(cast({column_expr} as varchar)) in ({placeholders})")
+                params.extend(matched_values)
+                labels.append(f"{_humanize_field(column)} in {', '.join(matched_values[:4])}")
+        if active_terms and lowered in {"is_active", "active", "enroll_active"}:
+            expected = 0 if "inactive" in active_terms else 1
+            clauses.append(f"try_cast({column_expr} as integer) = ?")
+            params.append(expected)
+            labels.append(f"{_humanize_field(column)} = {expected}")
+    if not clauses:
+        return "", [], []
+    return " and (" + " or ".join(f"({clause})" for clause in clauses) + ")", params, labels
+
+
+def _json_source_filter_sql(con: Any, source_path: str, question: str) -> tuple[str, list[Any], list[str]]:
+    filter_terms = _query_filter_intent_terms(question)
+    if not filter_terms:
+        return "", [], []
+    fields = _duckdb_json_field_names(con, source_path)
+    if not fields:
+        return "", [], []
+    clauses: list[str] = []
+    params: list[Any] = []
+    labels: list[str] = []
+    completion_terms = filter_terms & {"complete", "completed", "completion", "finish", "finished", "pass", "passed", "status", "result"}
+    active_terms = filter_terms & {"active", "inactive"}
+    for field in fields:
+        field_terms = _field_terms(field)
+        value_expr = _json_extract_expr(field)
+        lowered = field.lower()
+        if completion_terms and field_terms & {"status", "result", "learning"}:
+            try:
+                values = con.execute(
+                    f"""
+                    select distinct lower(cast({value_expr} as varchar)) as value
+                    from unified_records
+                    where source_path = ?
+                      and payload_json is not null
+                      and {value_expr} is not null
+                      and cast({value_expr} as varchar) <> ''
+                    limit 100
+                    """,
+                    [source_path],
+                ).fetchall()
+            except Exception:
+                values = []
+            matched_values = [
+                str(value)
+                for (value,) in values
+                if value is not None and (_field_terms(str(value)) & completion_terms)
+            ]
+            if matched_values:
+                placeholders = ", ".join("?" for _ in matched_values)
+                clauses.append(f"lower(cast({value_expr} as varchar)) in ({placeholders})")
+                params.extend(matched_values)
+                labels.append(f"{_humanize_field(field)} in {', '.join(matched_values[:4])}")
+        if active_terms and lowered in {"is_active", "active", "enroll_active"}:
+            expected = 0 if "inactive" in active_terms else 1
+            clauses.append(f"try_cast({value_expr} as integer) = ?")
+            params.append(expected)
+            labels.append(f"{_humanize_field(field)} = {expected}")
+    if not clauses:
+        return "", [], []
+    return " and (" + " or ".join(f"({clause})" for clause in clauses) + ")", params, labels
 
 
 def _humanize_field(field: str) -> str:
@@ -379,6 +664,22 @@ def _humanize_field(field: str) -> str:
             continue
         words.append(word[:1].upper() + word[1:].lower())
     return " ".join(words) if words else "Unknown"
+
+
+def _humanize_source_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "Unknown Source"
+    text = re.sub(r"^s3://[^/]+/", "", text.replace("\\", "/"))
+    text = re.sub(r"^duckdb/[^/]+/", "", text)
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        return _humanize_field(text)
+    basename = parts[-1]
+    parent = parts[-2] if len(parts) > 1 else ""
+    label = _humanize_field(basename)
+    parent_label = _humanize_field(parent) if parent and parent.lower() not in {"data", "json", "parquet", "duckdb"} else ""
+    return f"{parent_label} - {label}" if parent_label and parent_label not in label else label
 
 
 def _slot_safe_field(field: str) -> str:
@@ -492,7 +793,24 @@ def _aggregate_cache_activity(store: Any, question: str) -> dict[str, Any]:
 
 def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
     lowered = question.lower()
-    if not any(term in lowered for term in ("activity", "event", "user", "learner", "student", "course", "time", "trend")):
+    if not any(
+        term in lowered
+        for term in (
+            "activity",
+            "breakdown",
+            "compare",
+            "distribution",
+            "event",
+            "group",
+            "learner",
+            "status",
+            "student",
+            "user",
+            "course",
+            "time",
+            "trend",
+        )
+    ):
         return {}
     db_path = _duckdb_database_path(store)
     if db_path is None or not db_path.exists():
@@ -526,6 +844,7 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
             and ("time" in lowered or "trend" in lowered or "over time" in lowered)
         )
 
+        extra_where, filter_params, filter_labels = _json_source_filter_sql(con, source_path, question)
         timeline = _duckdb_time_buckets(con, source_path, timestamp_field, user_field)
         counts: dict[str, list[dict[str, Any]]] = {}
         count_fields: list[str] = []
@@ -533,8 +852,8 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
         source_fields = _duckdb_json_field_names(con, source_path)
         matched_count_fields = [
             field
-            for field in sorted(source_fields, key=lambda field: (-_field_score(field, intent_terms), field.lower()))
-            if _field_score(field, intent_terms) > 0
+            for field in sorted(source_fields, key=lambda field: (-_dimension_field_score(field, question, intent_terms), field.lower()))
+            if _dimension_field_score(field, question, intent_terms) > 0
         ]
         if not wants_user_time:
             count_fields = [
@@ -557,9 +876,12 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
         count_fields = list(dict.fromkeys(count_fields))[:8]
         for field in count_fields:
             if field:
-                counts[field] = _duckdb_top_counts(con, source_path, field)
+                if _should_show_unfiltered_distribution(question, field):
+                    counts[field] = _duckdb_top_counts(con, source_path, field)
+                else:
+                    counts[field] = _duckdb_top_counts(con, source_path, field, extra_where=extra_where, params=filter_params)
 
-        records = _duckdb_sample_records(con, source_path, limit=12)
+        records = _duckdb_sample_records(con, source_path, limit=12, extra_where=extra_where, params=filter_params)
         full_time_buckets = [{"label": row["label"], "value": row["value"]} for row in timeline]
         full_user_time_buckets = [
             {"label": row["label"], "value": row["users"]}
@@ -604,11 +926,11 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
         )
         chart_slots = _retitle_slots_for_prompt(question, chart_slots)
         chart_plan = [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots]
-        total_records = source.get("records")
+        total_records = _duckdb_source_record_count(con, source_path, extra_where=extra_where, params=filter_params)
         source_paths = [source_path] if source_path else []
         source_samples = _source_sample_records(con, source_paths, limit_per_source=50)
         distinct_users = _duckdb_distinct_activity_users(con) if wants_user_time else (
-            _duckdb_distinct_count(con, source_path, user_field) if user_field else 0
+            _duckdb_distinct_count(con, source_path, user_field, extra_where=extra_where, params=filter_params) if user_field else 0
         )
         activity = {
             "datasets": {
@@ -638,6 +960,7 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
                 "distinctEvents": len(counts.get(event_field or "", [])),
                 "distinctCourses": len(counts.get(course_field or "", [])),
                 "distinctUsers": distinct_users,
+                "filters": filter_labels,
             },
         }
         activity["layoutSpec"] = _activity_layout_spec(question, activity)
@@ -662,6 +985,8 @@ def _graph_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]
     lowered = question.lower()
     if not any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank")):
         return {}
+    if _needs_duckdb_filter(question):
+        return {}
     aggregates = _graph_aggregate_values(store, "ranked_dimension")
     if not aggregates:
         return {}
@@ -673,7 +998,7 @@ def _graph_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]
         dimension = str(aggregate.get("dimension_field") or "")
         measure = str(aggregate.get("measure_field") or "")
         score = float(len(query_terms & semantic_terms) * 2)
-        score += _ranked_dimension_score(dimension, query_terms)
+        score += _ranked_dimension_score(dimension, query_terms, question)
         score += _ranked_measure_score(measure, measure_terms)
         if score > 0:
             scored.append((score, aggregate))
@@ -719,9 +1044,9 @@ def _graph_time_series_activity_context(store: Any, question: str) -> dict[str, 
             {
                 "id": "activityTimeline",
                 "title": "Activity over time",
-                "chartType": "line",
+                "chartType": "area",
                 "field": "records@time",
-                "reason": "Graph aggregate of cumulative activity records by time bucket.",
+                "reason": "Graph aggregate of cumulative activity record volume by time bucket.",
                 "data": records_series,
             }
         )
@@ -927,7 +1252,8 @@ def _infer_source_paths_for_table(
     for source_path, source_table, records in rows:
         source_path = str(source_path)
         lineage_path = _lineage_source_path(source_path)
-        source_terms = _lineage_terms(f"{source_path} {source_table or ''}")
+        source_label = _humanize_source_path(source_path)
+        source_terms = _lineage_terms(f"{source_path} {source_label} {source_table or ''}")
         score = len(target_terms & source_terms)
         score += 8 * len(dimension_terms & source_terms)
         if "fact" in table_terms and "fact" in source_terms:
@@ -1063,6 +1389,8 @@ def _ranked_sample_records(
     top_label: str,
     *,
     limit: int = 12,
+    extra_where: str = "",
+    params: list[Any] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
@@ -1080,9 +1408,10 @@ def _ranked_sample_records(
         from {_duckdb_quote_identifier(table)}
         where {_duckdb_quote_identifier(dimension)} is not null
           and cast({_duckdb_quote_identifier(dimension)} as varchar) = ?
+          {extra_where}
         limit ?
         """,
-        [top_label, int(limit)],
+        [top_label, *(params or []), int(limit)],
     ).fetchall()
     records: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
@@ -1170,6 +1499,7 @@ def _ranked_decision_trace(
     chart_data: list[dict[str, Any]],
     total_measure: int,
     total_dimensions: int,
+    chart_type: str,
 ) -> list[dict[str, Any]]:
     return [
         _decision_trace_item(
@@ -1192,7 +1522,7 @@ def _ranked_decision_trace(
         ),
         _decision_trace_item(
             "Choose layout",
-            "Used two KPI cards plus a horizontal bar chart because ranked labels can be long and need readable comparison.",
+            f"Used KPI cards plus a {chart_type.replace('_', ' ')} chart because it fits the selected ranked field shape.",
             [
                 f"Top metric: {chart_data[0].get('label') if chart_data else 'not available'}",
                 f"Total distinct {measure_label}: {total_measure}",
@@ -1201,8 +1531,8 @@ def _ranked_decision_trace(
         ),
         _decision_trace_item(
             "Bind chart",
-            f"Bound {dimension_label} to bar labels and distinct {measure_label} to bar values.",
-            [f"Chart type: horizontal_bar", f"Top bars shown: {len(chart_data)}"],
+            f"Bound {dimension_label} to chart labels and distinct {measure_label} to chart values.",
+            [f"Chart type: {chart_type}", f"Values shown: {len(chart_data)}"],
         ),
     ]
 
@@ -1247,6 +1577,179 @@ def _time_series_decision_trace(
             [f"Chart count: {len(chart_slots)}"],
         ),
     ]
+
+
+def _ranked_layout_spec(
+    *,
+    question: str,
+    dimension_label: str,
+    measure_label: str,
+    slot_id: str,
+    chart_data: list[dict[str, Any]],
+    filter_labels: list[str] | None = None,
+) -> dict[str, Any]:
+    filter_labels = filter_labels or []
+    fallback = _fallback_ranked_layout_spec(
+        question=question,
+        dimension_label=dimension_label,
+        measure_label=measure_label,
+        slot_id=slot_id,
+        chart_data=chart_data,
+        filter_labels=filter_labels,
+    )
+    llm_spec = _llm_ranked_layout_spec(
+        question=question,
+        dimension_label=dimension_label,
+        measure_label=measure_label,
+        slot_id=slot_id,
+        chart_data=chart_data,
+        filter_labels=filter_labels,
+    )
+    return _sanitize_ranked_layout_spec(llm_spec, slot_id, fallback)
+
+
+def _fallback_ranked_layout_spec(
+    *,
+    question: str,
+    dimension_label: str,
+    measure_label: str,
+    slot_id: str,
+    chart_data: list[dict[str, Any]],
+    filter_labels: list[str],
+) -> dict[str, Any]:
+    lowered = question.lower()
+    if {"finish", "finished", "complete", "completed", "pass", "passed"} & set(_intent_terms(question)):
+        focus = "Completed"
+    elif filter_labels:
+        focus = "Filtered"
+    else:
+        focus = ""
+    measure_text = measure_label.lower() if focus else measure_label
+    dimension_text = dimension_label.lower() if focus else dimension_label
+    title = f"{focus} {measure_text} by {dimension_text}".strip()
+    subtitle_parts = []
+    if chart_data:
+        subtitle_parts.append(f"{chart_data[0].get('label')} leads this comparison")
+    if filter_labels:
+        subtitle_parts.append(f"filters: {', '.join(filter_labels[:3])}")
+    subtitle = ". ".join(subtitle_parts) + ("." if subtitle_parts else "")
+    return {
+        "title": title,
+        "subtitle": subtitle,
+        "chartTitle": f"{measure_label} by {dimension_label}",
+        "metricLabels": {
+            "topDimensionValue": f"Leading {measure_label}",
+            "totalDistinctMeasure": f"Matched {measure_label}",
+            "distinctDimensionValues": f"{dimension_label} groups",
+        },
+        "blocks": [
+            {"type": "metric", "id": "topDimensionValue", "span": 1},
+            {"type": "metric", "id": "totalDistinctMeasure", "span": 1},
+            {"type": "chart", "slotId": slot_id, "span": 2},
+        ],
+    }
+
+
+def _llm_ranked_layout_spec(
+    *,
+    question: str,
+    dimension_label: str,
+    measure_label: str,
+    slot_id: str,
+    chart_data: list[dict[str, Any]],
+    filter_labels: list[str],
+) -> dict[str, Any] | None:
+    if get_settings().llm_mode == "never":
+        return None
+    candidates = _llm_candidates()
+    if not candidates:
+        return None
+    from langchain_openai import ChatOpenAI
+
+    messages = [
+        (
+            "system",
+            (
+                "You are planning a dashboard for the user's actual analytical request. "
+                "Return only JSON with title, subtitle, chartTitle, metricLabels, and blocks. "
+                "Do not use a fixed template like 'Top X by Y' unless the user's wording requires exactly that. "
+                "Use concise human labels derived from the request, filters, dimension, and measure. "
+                "Allowed metric ids: topDimensionValue, totalDistinctMeasure, distinctDimensionValues. "
+                f"Allowed chart slot id: {slot_id}. "
+                "Blocks must use only these ids and this chart slot."
+            ),
+        ),
+        (
+            "human",
+            json.dumps(
+                {
+                    "question": question,
+                    "dimension": dimension_label,
+                    "measure": measure_label,
+                    "filters": filter_labels,
+                    "chartSlotId": slot_id,
+                    "topRows": chart_data[:5],
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        ),
+    ]
+    for candidate in candidates[:1]:
+        try:
+            model = ChatOpenAI(
+                api_key=candidate["api_key"],
+                model=candidate["model"],
+                base_url=candidate.get("base_url"),
+                default_headers=candidate.get("headers") or None,
+                temperature=0,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+            response = model.invoke(messages)
+            parsed = json.loads(str(response.content))
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _sanitize_ranked_layout_spec(
+    spec: dict[str, Any] | None,
+    slot_id: str,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        return fallback
+    title = str(spec.get("title") or fallback["title"]).strip() or fallback["title"]
+    subtitle = str(spec.get("subtitle") or fallback.get("subtitle") or "").strip()
+    chart_title = str(spec.get("chartTitle") or fallback.get("chartTitle") or "").strip()
+    metric_labels = spec.get("metricLabels") if isinstance(spec.get("metricLabels"), dict) else {}
+    allowed_metrics = {"topDimensionValue", "totalDistinctMeasure", "distinctDimensionValues"}
+    blocks: list[dict[str, Any]] = []
+    raw_blocks = spec.get("blocks") if isinstance(spec.get("blocks"), list) else []
+    for block in raw_blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        span = 2 if block.get("span") == 2 else 1
+        if block_type == "metric" and block.get("id") in allowed_metrics:
+            blocks.append({"type": "metric", "id": block["id"], "span": span})
+        elif block_type == "chart" and block.get("slotId") == slot_id:
+            blocks.append({"type": "chart", "slotId": slot_id, "span": 2})
+    if not any(block.get("type") == "chart" for block in blocks):
+        blocks.append({"type": "chart", "slotId": slot_id, "span": 2})
+    if not blocks:
+        blocks = fallback["blocks"]
+    return {
+        "title": title,
+        "subtitle": subtitle,
+        "chartTitle": chart_title or fallback.get("chartTitle"),
+        "metricLabels": {
+            **fallback.get("metricLabels", {}),
+            **{str(key): str(value) for key, value in metric_labels.items() if key in allowed_metrics and value},
+        },
+        "blocks": blocks[:8],
+    }
 
 
 def _activity_decision_trace(
@@ -1347,11 +1850,19 @@ def _ranked_dimension_activity_from_payload(
     ]
     source_samples = _source_sample_records_from_duckdb(aggregate, source_paths)
     slot_id = f"top-{_slot_safe_field(dimension)}-by-{_slot_safe_field(measure)}"
+    layout_spec = _ranked_layout_spec(
+        question=question,
+        dimension_label=dimension_label,
+        measure_label=measure_label,
+        slot_id=slot_id,
+        chart_data=chart_data,
+    )
+    chart_type = _ranked_chart_type_for_dimension(dimension, chart_data, question)
     chart_slots = [
         {
             "id": slot_id,
-            "title": f"{dimension_label} by {measure_label}",
-            "chartType": "horizontal_bar",
+            "title": layout_spec.get("chartTitle") or f"{measure_label} by {dimension_label}",
+            "chartType": chart_type,
             "field": dimension,
             "reason": f"Ranked aggregate read from {source_kind} graph context.",
             "data": chart_data,
@@ -1369,6 +1880,7 @@ def _ranked_dimension_activity_from_payload(
         chart_data=chart_data,
         total_measure=total_measure,
         total_dimensions=total_dimensions,
+        chart_type=chart_type,
     )
     return {
         "datasets": {
@@ -1403,22 +1915,16 @@ def _ranked_dimension_activity_from_payload(
             "measureName": measure_label,
             "totalDistinctMeasure": total_measure,
             "distinctDimensionValues": total_dimensions,
+            "metricLabels": layout_spec.get("metricLabels") or {},
         },
-        "layoutSpec": {
-            "title": f"Top {dimension_label} by {measure_label}",
-            "subtitle": f"{top_label} has the highest distinct {measure_label}.",
-            "blocks": [
-                {"type": "metric", "id": "topDimensionValue", "span": 1},
-                {"type": "metric", "id": "totalDistinctMeasure", "span": 1},
-                {"type": "chart", "slotId": slot_id, "span": 2},
-            ],
-        },
+        "layoutSpec": {key: value for key, value in layout_spec.items() if key != "metricLabels"},
     }
 
 
 def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]:
     lowered = question.lower()
-    wants_rank = any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank"))
+    wants_grouped = " by " in lowered and any(term in lowered for term in ("user", "users", "student", "learner", "course"))
+    wants_rank = any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank")) or wants_grouped
     if not wants_rank:
         return {}
     db_path = _duckdb_database_path(store)
@@ -1441,6 +1947,7 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
         measure = str(plan["measure"])
         dimension_expr = _duckdb_quote_identifier(dimension)
         measure_expr = _duckdb_quote_identifier(measure)
+        extra_where, filter_params, filter_labels = _ranked_filter_sql(con, table, question)
         rows = con.execute(
             f"""
             select
@@ -1451,10 +1958,13 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
               and cast({dimension_expr} as varchar) <> ''
               and lower(cast({dimension_expr} as varchar)) not in ('unknown', 'none', 'null')
               and {measure_expr} is not null
+              {extra_where}
             group by 1
             order by value desc, label
             limit 12
             """
+            ,
+            filter_params,
         ).fetchall()
         if not rows:
             return {}
@@ -1467,7 +1977,10 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
                   and {dimension_expr} is not null
                   and cast({dimension_expr} as varchar) <> ''
                   and lower(cast({dimension_expr} as varchar)) not in ('unknown', 'none', 'null')
+                  {extra_where}
                 """
+                ,
+                filter_params,
             ).fetchone()[0]
             or 0
         )
@@ -1479,7 +1992,10 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
                 where {dimension_expr} is not null
                   and cast({dimension_expr} as varchar) <> ''
                   and lower(cast({dimension_expr} as varchar)) not in ('unknown', 'none', 'null')
+                  {extra_where}
                 """
+                ,
+                filter_params,
             ).fetchone()[0]
             or 0
         )
@@ -1490,15 +2006,32 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
         measure_label = _measure_display_name(measure)
         source_paths = _source_paths_for_table(con, table, question=question, fields=[dimension, measure])
         source_samples = _source_sample_records(con, source_paths, limit_per_source=50)
-        sample_records = _ranked_sample_records(con, table, dimension, top_label, limit=12)
+        sample_records = _ranked_sample_records(
+            con,
+            table,
+            dimension,
+            top_label,
+            limit=12,
+            extra_where=extra_where,
+            params=filter_params,
+        )
         slot_id = f"top-{_slot_safe_field(dimension)}-by-{_slot_safe_field(measure)}"
+        layout_spec = _ranked_layout_spec(
+            question=question,
+            dimension_label=dimension_label,
+            measure_label=measure_label,
+            slot_id=slot_id,
+            chart_data=chart_data,
+            filter_labels=filter_labels,
+        )
+        chart_type = _ranked_chart_type_for_dimension(dimension, chart_data, question)
         chart_slots = [
             {
                 "id": slot_id,
-                "title": f"{dimension_label} by {measure_label}",
-                "chartType": "horizontal_bar",
+                "title": layout_spec.get("chartTitle") or f"{measure_label} by {dimension_label}",
+                "chartType": chart_type,
                 "field": dimension,
-                "reason": "A ranked bar chart answers the requested top dimension by distinct measure.",
+                "reason": "A ranked chart answers the requested top dimension by distinct measure after applying prompt filters.",
                 "data": chart_data,
             }
         ]
@@ -1514,6 +2047,7 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
             chart_data=chart_data,
             total_measure=total_measure,
             total_dimensions=total_dimensions,
+            chart_type=chart_type,
         )
         activity = {
             "datasets": {
@@ -1552,16 +2086,10 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
                 "measureName": measure_label,
                 "totalDistinctMeasure": total_measure,
                 "distinctDimensionValues": total_dimensions,
+                "filters": filter_labels,
+                "metricLabels": layout_spec.get("metricLabels") or {},
             },
-            "layoutSpec": {
-                "title": f"Top {dimension_label} by {measure_label}",
-                "subtitle": f"{top_label} has the highest distinct {measure_label}.",
-                "blocks": [
-                    {"type": "metric", "id": "topDimensionValue", "span": 1},
-                    {"type": "metric", "id": "totalDistinctMeasure", "span": 1},
-                    {"type": "chart", "slotId": slot_id, "span": 2},
-                ],
-            },
+            "layoutSpec": {key: value for key, value in layout_spec.items() if key != "metricLabels"},
         }
         return activity
     except Exception:
@@ -1585,15 +2113,18 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
     ]
     intent_terms = set(_intent_terms(_expand_ranked_query_terms(question)))
     measure_terms = _measure_terms(question)
+    requires_filter = _needs_duckdb_filter(question)
     candidates: list[tuple[float, str, str, str]] = []
     for table in tables:
         if any(skip in table for skip in ("cache", "map")):
+            continue
+        if requires_filter and not _ranked_filter_sql(con, table, question)[0]:
             continue
         columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
         measure_columns = [column for column in columns if _is_measure_column(column, measure_terms)]
         dimension_columns = [column for column in columns if _is_dimension_column(column)]
         for dimension in dimension_columns:
-            dimension_score = _ranked_dimension_score(dimension, intent_terms)
+            dimension_score = _ranked_dimension_score(dimension, intent_terms, question)
             if dimension_score <= 0:
                 continue
             for measure in measure_columns:
@@ -1672,23 +2203,34 @@ def _is_dimension_column(column: str) -> bool:
         return False
     return any(
         token in lowered
-        for token in ("name", "school", "institute", "department", "province", "course", "category", "type", "status")
+        for token in ("name", "school", "institute", "department", "province", "course", "category", "type", "status", "education", "level")
     )
 
 
-def _ranked_dimension_score(column: str, intent_terms: set[str]) -> float:
-    score = _field_score(column, intent_terms)
+def _ranked_dimension_score(column: str, intent_terms: set[str], question: str = "") -> float:
+    score = _dimension_field_score(column, question, intent_terms) if question else _field_score(column, intent_terms)
     field_terms = _field_terms(column)
     if "name" in field_terms:
         score += 1.5
     if {"school", "institute"} & intent_terms and {"school", "institute"} & field_terms:
         score += 4.0
+    if {"school", "institute"} & intent_terms:
+        if "name" in field_terms or "school" in field_terms:
+            score += 4.0
+        if "id" in field_terms and "id" not in _query_dimension_terms(question):
+            score -= 4.0
     lowered = column.lower()
     if "course" in intent_terms:
-        if lowered in {"course_id", "subject_name"}:
-            score += 5.0
-        if any(term in lowered for term in ("teacher", "faculty", "org")):
-            score -= 3.0
+        if lowered in {"course_id", "subject_name"} and not (_query_dimension_terms(question) - {"course"}):
+            score += 12.0
+        course_focus_terms = _query_dimension_terms(question)
+        course_metadata_terms = {"teacher", "faculty", "org", "organization", "type", "category"}
+        if any(term in lowered for term in course_metadata_terms) and not (course_focus_terms & course_metadata_terms):
+            score -= 12.0
+    metric_like_terms = {"activity", "avg", "average", "count", "date", "grade", "max", "min", "rate", "score", "total"}
+    focus_terms = _query_dimension_terms(question)
+    if field_terms & metric_like_terms and not (focus_terms & metric_like_terms):
+        score -= 20.0
     return score
 
 
@@ -1751,7 +2293,8 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
             "source_table": source_table,
             "records": records,
         }
-        haystack = f"{source_path} {source_table}".lower()
+        source_label = _humanize_source_path(source_path)
+        haystack = f"{source_path} {source_label} {source_table}".lower()
         score = 0.0
         for term in intent_terms:
             if term in haystack:
@@ -1768,9 +2311,14 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
             pass
         fields = _infer_duckdb_json_fields(con, str(source_path))
         source_fields = _duckdb_json_field_names(con, str(source_path))
-        field_match_score = sum(_field_score(field, intent_terms) for field in source_fields)
+        field_match_score = sum(_dimension_field_score(field, question, intent_terms) for field in source_fields)
         if field_match_score:
             score += min(field_match_score, 10.0)
+        focus_terms = _query_dimension_terms(question)
+        if focus_terms:
+            best_focus_score = max((_dimension_field_score(field, question, intent_terms) for field in source_fields), default=0.0)
+            if best_focus_score:
+                score += min(best_focus_score, 30.0)
         if completion_terms:
             has_completion_field = any(_field_score(field, completion_terms) > 0 for field in source_fields)
             score += 15.0 if has_completion_field else -8.0
@@ -1995,7 +2543,38 @@ def _duckdb_table_exists(con: Any, table_name: str) -> bool:
         return False
 
 
-def _duckdb_top_counts(con: Any, source_path: str, field: str, limit: int = 8) -> list[dict[str, Any]]:
+def _duckdb_source_record_count(
+    con: Any,
+    source_path: str,
+    *,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+) -> int:
+    try:
+        value = con.execute(
+            f"""
+            select count(*)
+            from unified_records
+            where source_path = ?
+              and payload_json is not null
+              {extra_where}
+            """,
+            [source_path, *(params or [])],
+        ).fetchone()[0]
+    except Exception:
+        return 0
+    return int(value or 0)
+
+
+def _duckdb_top_counts(
+    con: Any,
+    source_path: str,
+    field: str,
+    limit: int = 8,
+    *,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+) -> list[dict[str, Any]]:
     value_sql = _json_extract_expr(field)
     rows = con.execute(
         f"""
@@ -2003,17 +2582,25 @@ def _duckdb_top_counts(con: Any, source_path: str, field: str, limit: int = 8) -
         from unified_records
         where source_path = ?
           and payload_json is not null
+          {extra_where}
         group by label
         having label is not null
         order by value desc, label
         limit {int(limit)}
         """,
-        [source_path],
+        [source_path, *(params or [])],
     ).fetchall()
     return [{"label": str(label), "value": int(value)} for label, value in rows]
 
 
-def _duckdb_distinct_count(con: Any, source_path: str, field: str) -> int:
+def _duckdb_distinct_count(
+    con: Any,
+    source_path: str,
+    field: str,
+    *,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+) -> int:
     value_sql = _json_extract_expr(field)
     try:
         value = con.execute(
@@ -2022,8 +2609,9 @@ def _duckdb_distinct_count(con: Any, source_path: str, field: str) -> int:
             from unified_records
             where source_path = ?
               and payload_json is not null
+              {extra_where}
             """,
-            [source_path],
+            [source_path, *(params or [])],
         ).fetchone()[0]
     except Exception:
         return 0
@@ -2053,7 +2641,14 @@ def _duckdb_distinct_activity_users(con: Any) -> int:
     return 0
 
 
-def _duckdb_sample_records(con: Any, source_path: str, limit: int = 12) -> list[dict[str, Any]]:
+def _duckdb_sample_records(
+    con: Any,
+    source_path: str,
+    limit: int = 12,
+    *,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+) -> list[dict[str, Any]]:
     if (
         source_path == "edx-elastic/ae-activity-data-stream.json"
         and _duckdb_table_exists(con, "dashboard_agent_activity_joined")
@@ -2118,14 +2713,15 @@ def _duckdb_sample_records(con: Any, source_path: str, limit: int = 12) -> list[
             for index, row in enumerate(rows)
         ]
     rows = con.execute(
-        """
+        f"""
         select payload_json
         from unified_records
         where source_path = ?
           and payload_json is not null
+          {extra_where}
         limit ?
         """,
-        [source_path, int(limit)],
+        [source_path, *(params or []), int(limit)],
     ).fetchall()
     records: list[dict[str, Any]] = []
     for index, (payload_json,) in enumerate(rows):
@@ -2279,7 +2875,7 @@ def _design_generic_chart_plan(
     plan: list[dict[str, Any]] = []
 
     if wants_time:
-        distinct_fields = _rank_fields(full_distinct_time_buckets, intent_terms)
+        distinct_fields = _rank_fields(full_distinct_time_buckets, intent_terms, question)
         for field in distinct_fields[:3]:
             field_label = _humanize_field(field)
             plan.append(
@@ -2299,18 +2895,18 @@ def _design_generic_chart_plan(
             {
                 "id": "activityTimeline",
                 "title": "Activity over time",
-                "chartType": "line",
+                "chartType": "area",
                 "field": "@time",
-                "reason": "A line chart shows record volume by detected time bucket.",
+                "reason": "An area chart emphasizes activity volume by detected time bucket.",
             }
         )
 
-    for field in _rank_fields(full_counts, intent_terms)[:6]:
+    for field in _rank_fields(full_counts, intent_terms, question)[:6]:
         rows = full_counts.get(field) or []
         if not rows:
             continue
         field_label = _humanize_field(field)
-        chart_type = "stat" if len(rows) == 1 else "horizontal_bar"
+        chart_type = _chart_type_for_count_field(field, rows, question)
         plan.append(
             {
                 "id": f"fieldCounts-{_slot_safe_field(field)}",
@@ -2319,18 +2915,19 @@ def _design_generic_chart_plan(
                 "field": field,
                 "sourceField": field,
                 "aggregate": "count",
-                "reason": "A distribution chart compares the most frequent values for this matched field.",
+                "reason": f"A {chart_type.replace('_', ' ')} chart fits this field's cardinality, label length, and requested comparison.",
             }
         )
 
     return plan[:6]
 
 
-def _rank_fields(rows_by_field: dict[str, Any], intent_terms: set[str]) -> list[str]:
+def _rank_fields(rows_by_field: dict[str, Any], intent_terms: set[str], question: str = "") -> list[str]:
     def sort_key(field: str) -> tuple[float, int, str]:
         rows = rows_by_field.get(field)
         row_count = len(rows) if isinstance(rows, list) else 0
-        return (-_field_score(field, intent_terms), -row_count, field.lower())
+        score = _dimension_field_score(field, question, intent_terms) if question else _field_score(field, intent_terms)
+        return (-score, -row_count, field.lower())
 
     return sorted((field for field in rows_by_field if isinstance(field, str)), key=sort_key)
 
@@ -2381,9 +2978,9 @@ def _design_activity_chart_plan(
             {
                 "id": "activityTimeline",
                 "title": "Activity over sampled time",
-                "chartType": "line",
+                "chartType": "area",
                 "field": "@timestamp",
-                "reason": "A line chart fits timestamped records and shows activity order over the sample window.",
+                "reason": "An area chart fits timestamped record volume over the sample window.",
             }
         )
     if candidate_fields["event"]:
@@ -2521,7 +3118,7 @@ def _activity_layout_spec(question: str, activity: dict[str, Any]) -> dict[str, 
         "distinctUsers": summary.get("distinctUsers"),
     }
     available_metrics = {key for key, value in metrics.items() if value not in (None, "", 0)}
-    fallback = _fallback_activity_layout_spec(question, available_slots, available_metrics)
+    fallback = _fallback_activity_layout_spec(question, available_slots, available_metrics, summary)
     if summary.get("isFullAggregate") and available_slots:
         return fallback
     llm_spec = _llm_activity_layout_spec(question, chart_slots, summary, available_metrics)
@@ -2532,11 +3129,15 @@ def _fallback_activity_layout_spec(
     question: str,
     available_slots: set[str],
     available_metrics: set[str],
+    summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    summary = summary or {}
     lowered = question.lower()
     wants_user = "user" in lowered or "learner" in lowered or "student" in lowered
     wants_time = "time" in lowered or "trend" in lowered or "overtime" in lowered or "over time" in lowered
     wants_count = "number" in lowered or "count" in lowered or "how many" in lowered or "total" in lowered
+    wants_rank = any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank"))
+    wants_breakdown = any(term in lowered for term in ("by", "breakdown", "distribution", "compare", "split", "group"))
     wants_course = "course" in lowered
     wants_event = "event" in lowered or "activity" in lowered or "click" in lowered
 
@@ -2551,12 +3152,14 @@ def _fallback_activity_layout_spec(
         intent_terms = set(_intent_terms(question))
         return sorted(
             (slot_id for slot_id in available_slots if slot_id not in excluded_ids),
-            key=lambda slot_id: (-_field_score(slot_id, intent_terms), slot_id),
+            key=lambda slot_id: (-_dimension_field_score(slot_id, question, intent_terms), slot_id),
         )
 
     blocks: list[dict[str, Any]] = []
     title = "Activity dashboard"
     subtitle = "Dashboard selected from the fields and aggregates matched to the prompt."
+    filters = [str(item) for item in summary.get("filters") or [] if item]
+    count_only = wants_count and not wants_time and not wants_rank and not wants_breakdown
     if wants_user and wants_time:
         title = "Users over time"
         subtitle = (
@@ -2571,7 +3174,36 @@ def _fallback_activity_layout_spec(
             blocks.append(chart("userTimeline", 2))
         if "users" in available_slots:
             blocks.append(chart("users", 2 if "userTimeline" not in available_slots else 1))
+    elif wants_breakdown:
+        focused_slots = dynamic_slots("events", "courses", "categories", "users", "apps")
+        primary_slot = focused_slots[0] if focused_slots else ""
+        primary_label = _humanize_field(primary_slot.replace("fieldCounts-", "").replace("-", "_")) if primary_slot else "Distribution"
+        title = primary_label
+        subtitle = "Distribution matched to the requested field."
+        for metric_id in ("totalRecords", "distinctUsers"):
+            if metric_id in available_metrics:
+                blocks.append(metric(metric_id))
+        for slot_id in focused_slots[:4]:
+            blocks.append(chart(slot_id, 2 if slot_id == primary_slot else 1))
+        for slot_id in ("events", "courses", "categories", "users", "apps"):
+            if slot_id in available_slots and slot_id not in focused_slots:
+                blocks.append(chart(slot_id, 1))
     elif wants_user:
+        if count_only:
+            if _query_filter_intent_terms(question):
+                title = "Completed users" if {"finish", "finished", "complete", "completed", "pass", "passed"} & set(_intent_terms(question)) else "Filtered users"
+                subtitle = f"Distinct users after applying: {', '.join(filters[:3])}." if filters else "Distinct users after applying the matched filter."
+            else:
+                title = "User count"
+                subtitle = "Distinct users matched to the request."
+            for metric_id in ("distinctUsers", "totalRecords"):
+                if metric_id in available_metrics:
+                    blocks.append(metric(metric_id))
+            focused_slots = dynamic_slots("users")
+            if focused_slots:
+                blocks.append(chart(focused_slots[0], 2))
+            blocks.append({"type": "source", "span": 2})
+            return {"title": title, "subtitle": subtitle, "blocks": blocks[:8]}
         title = "User count" if wants_count else "User activity"
         for metric_id in ("distinctUsers", "totalRecords"):
             if metric_id in available_metrics:
@@ -2933,10 +3565,10 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
     results = cache_results + store.search(question, limit=24)
     if _wants_dashboard(question):
         activity = (
-            _aggregate_cache_activity(store, question)
+            _duckdb_ranked_dimension_context(store, question)
             or _graph_ranked_dimension_context(store, question)
             or _graph_time_series_activity_context(store, question)
-            or _duckdb_ranked_dimension_context(store, question)
+            or _aggregate_cache_activity(store, question)
             or _duckdb_activity_context(store, question)
             or _activity_dashboard_context(store, results, question)
         )

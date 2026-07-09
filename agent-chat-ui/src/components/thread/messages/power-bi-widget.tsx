@@ -14,6 +14,8 @@ import {
   Users,
 } from "lucide-react";
 import {
+  Area,
+  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
@@ -24,6 +26,7 @@ import {
   PieChart,
   ResponsiveContainer,
   Tooltip,
+  Treemap,
   XAxis,
   YAxis,
 } from "recharts";
@@ -793,6 +796,78 @@ function TimelineChartCard({ data, title }: { data: ChartDatum[]; title: string 
   );
 }
 
+function AreaChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data.map((item) => ({
+    label: item.label,
+    value: Number(item.value ?? item.score ?? 0),
+  }));
+  if (!chartData.length) return null;
+
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {title}
+      </p>
+      <div className="mt-3 h-56">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={chartData} margin={{ top: 8, right: 12, bottom: 8, left: -8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 10 }} minTickGap={24} />
+            <YAxis tick={{ fontSize: 10 }} tickFormatter={formatNumber} allowDecimals={false} width={42} />
+            <Tooltip formatter={(value) => formatNumber(value)} />
+            <Area
+              type="monotone"
+              dataKey="value"
+              stroke="#2563eb"
+              strokeWidth={2}
+              fill="#93c5fd"
+              fillOpacity={0.55}
+              activeDot={{ r: 5 }}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function TreemapChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data
+    .slice(0, 12)
+    .map((item) => ({
+      name: humanLabel(item.label),
+      rawLabel: item.label,
+      value: Number(item.value ?? item.score ?? 0),
+    }))
+    .filter((item) => item.value > 0);
+  if (!chartData.length) return null;
+
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {title}
+      </p>
+      <div className="mt-3 h-60">
+        <ResponsiveContainer width="100%" height="100%">
+          <Treemap
+            data={chartData}
+            dataKey="value"
+            nameKey="name"
+            stroke="#ffffff"
+            fill="#2563eb"
+            isAnimationActive={false}
+          >
+            <Tooltip
+              formatter={(value) => formatNumber(value)}
+              labelFormatter={(label) => String(label)}
+            />
+          </Treemap>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
 function StatSlotCard({
   data,
   title,
@@ -833,6 +908,9 @@ function ChartSlotCard({
   if (slot.chartType === "line") {
     return <TimelineChartCard data={slot.data} title={slot.title} />;
   }
+  if (slot.chartType === "area") {
+    return <AreaChartCard data={slot.data} title={slot.title} />;
+  }
   if (slot.chartType === "stat") {
     return <StatSlotCard data={slot.data} title={slot.title} field={slot.field} />;
   }
@@ -841,6 +919,9 @@ function ChartSlotCard({
   }
   if (slot.chartType === "column") {
     return <MiniColumnChart data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "treemap") {
+    return <TreemapChartCard data={slot.data} title={slot.title} />;
   }
   return <BreakdownList data={slot.data} title={slot.title} kind={kind} />;
 }
@@ -904,6 +985,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     : Object.values(activity?.datasets ?? {});
   const sourceMeta = datasetValues[0];
   const summary = activity?.summary ?? {};
+  const metricLabels =
+    ((summary as Record<string, unknown>).metricLabels as Record<string, string> | undefined) ?? {};
   const metricDefs: Record<
     string,
     { label: string; value: number | string | undefined; hint: string; icon: typeof Activity }
@@ -939,19 +1022,25 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
       icon: Users,
     },
     distinctDimensionValues: {
-      label: `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
+      label:
+        metricLabels.distinctDimensionValues ??
+        `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
       value: (summary as Record<string, unknown>).distinctDimensionValues as number | string | undefined,
       hint: "Distinct ranked dimension values",
       icon: Database,
     },
     totalDistinctMeasure: {
-      label: `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+      label:
+        metricLabels.totalDistinctMeasure ??
+        `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
       value: (summary as Record<string, unknown>).totalDistinctMeasure as number | string | undefined,
       hint: "Distinct values included in the aggregate",
       icon: Users,
     },
     topDimensionValue: {
-      label: `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+      label:
+        metricLabels.topDimensionValue ??
+        `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
       value: (summary as Record<string, unknown>).topDimensionValue as number | string | undefined,
       hint: formatValue((summary as Record<string, unknown>).topDimensionLabel, "Top value"),
       icon: Users,

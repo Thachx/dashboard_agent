@@ -54,6 +54,7 @@ class JsonGraphStore:
             return
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         self.graph = self._node_link_graph(payload)
+        self._enrich_graph_labels(self.graph)
         self.updated_at = float(self.graph.graph.get("updated_at", self.path.stat().st_mtime))
         if not self._load_search_index():
             self._write_search_index()
@@ -65,6 +66,7 @@ class JsonGraphStore:
             raise ValueError(f"{graph_kind} graph has no nodes: {graph_path}")
         if graph.number_of_nodes() > MAX_RUNTIME_GRAPH_NODES:
             graph = self._sample_graph(graph, max_nodes=MAX_RUNTIME_GRAPH_NODES, max_edges=MAX_RUNTIME_GRAPH_EDGES)
+        self._enrich_graph_labels(graph)
         self.updated_at = time.time()
         graph.graph.update(
             updated_at=self.updated_at,
@@ -86,9 +88,11 @@ class JsonGraphStore:
             graph.add_node(
                 root_id,
                 type="dataset",
-                label=source.key,
+                label=self._human_source_label(source.key),
+                file_label=self._human_source_label(source.key),
+                source_label=self._human_source_label(source.key),
                 path=source.key,
-                ETAG=source.ETAG,
+                ETAG=getattr(source, "ETAG", None) or getattr(source, "etag", ""),
                 object_type=source.object_type,
                 size=source.size,
                 text=f"S3 {source.object_type} dataset {source.key}",
@@ -121,6 +125,7 @@ class JsonGraphStore:
                     label=str(key),
                     path=child_path,
                     source=source_key,
+                    source_label=self._human_source_label(source_key),
                     text=f"{key} {self._preview(child)}",
                 )
                 graph.add_edge(parent_id, child_id, relation="has_field")
@@ -135,6 +140,7 @@ class JsonGraphStore:
                     label=f"[{index}]",
                     path=child_path,
                     source=source_key,
+                    source_label=self._human_source_label(source_key),
                     text=self._preview(child),
                 )
                 graph.add_edge(parent_id, child_id, relation="has_item")
@@ -232,11 +238,15 @@ class JsonGraphStore:
         return [self._row_result(row, score) for score, row in scored[:limit]]
 
     def _result_item(self, node_id: str, attrs: dict[str, Any], score: float) -> dict[str, Any]:
+        source = attrs.get("source") or attrs.get("source_file") or attrs.get("path") or attrs.get("file")
+        source_label = attrs.get("source_label") or attrs.get("file_label") or self._human_source_label(source)
         return {
             "id": node_id,
             "label": self._human_label(attrs.get("label") or attrs.get("name") or node_id),
             "path": attrs.get("path") or attrs.get("file") or attrs.get("source_file") or attrs.get("source"),
-            "source": attrs.get("source") or attrs.get("source_file") or attrs.get("path") or attrs.get("file"),
+            "source": source,
+            "sourceLabel": source_label,
+            "fileLabel": attrs.get("file_label") or source_label,
             "value": attrs.get("value"),
             "text": attrs.get("text") or attrs.get("summary") or attrs.get("content") or self._node_text(node_id, attrs),
             "score": round(score, 4),
@@ -283,14 +293,16 @@ class JsonGraphStore:
             return False
         payload = json.loads(index_path.read_text(encoding="utf-8"))
         self.index_status = dict(payload.get("status") or {})
-        self.search_rows = list(payload.get("rows") or [])
+        self.search_rows = [self._enrich_search_row(dict(row)) for row in payload.get("rows") or [] if isinstance(row, dict)]
         return True
 
     def _write_search_index(self) -> None:
         rows: list[dict[str, Any]] = []
         for node_id, attrs in self.graph.nodes(data=True):
             row = self._result_item(str(node_id), attrs, 0)
-            row["terms"] = sorted(self._terms(" ".join(str(row.get(key) or "") for key in ("id", "label", "path", "source", "text"))))
+            row["terms"] = sorted(
+                self._terms(" ".join(str(row.get(key) or "") for key in ("id", "label", "path", "source", "sourceLabel", "fileLabel", "text")))
+            )
             rows.append(row)
         self.search_rows = rows
         self.index_status = self.status()
@@ -304,10 +316,37 @@ class JsonGraphStore:
             "label": row.get("label"),
             "path": row.get("path"),
             "source": row.get("source"),
+            "sourceLabel": row.get("sourceLabel"),
+            "fileLabel": row.get("fileLabel"),
             "value": row.get("value"),
             "text": row.get("text") or "",
             "score": round(score, 4),
         }
+
+    @classmethod
+    def _enrich_search_row(cls, row: dict[str, Any]) -> dict[str, Any]:
+        source = row.get("source") or row.get("path") or row.get("id")
+        source_label = row.get("sourceLabel") or row.get("source_label") or row.get("fileLabel") or cls._human_source_label(source)
+        row["sourceLabel"] = source_label
+        row["fileLabel"] = row.get("fileLabel") or source_label
+        indexed_text = " ".join(
+            str(row.get(key) or "")
+            for key in ("id", "label", "path", "source", "sourceLabel", "fileLabel", "text")
+        )
+        row["terms"] = sorted(cls._terms(indexed_text))
+        return row
+
+    @classmethod
+    def _enrich_graph_labels(cls, graph: nx.Graph) -> None:
+        for _node_id, attrs in graph.nodes(data=True):
+            source = attrs.get("source") or attrs.get("source_file") or attrs.get("file") or attrs.get("path")
+            if source and not attrs.get("source_label"):
+                attrs["source_label"] = cls._human_source_label(source)
+            file_value = attrs.get("file") or attrs.get("source_file") or attrs.get("path") or source
+            if file_value and not attrs.get("file_label"):
+                attrs["file_label"] = cls._human_source_label(file_value)
+            if attrs.get("type") == "dataset" and attrs.get("label"):
+                attrs["label"] = cls._human_source_label(attrs.get("path") or attrs.get("label"))
 
     @staticmethod
     def _node_link_graph(payload: dict[str, Any]) -> nx.Graph:
@@ -413,3 +452,19 @@ class JsonGraphStore:
                 continue
             words.append(word[:1].upper() + word[1:].lower())
         return " ".join(words) if words else "Unknown"
+
+    @classmethod
+    def _human_source_label(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "Unknown Source"
+        text = re.sub(r"^s3://[^/]+/", "", text.replace("\\", "/"))
+        text = re.sub(r"^duckdb/[^/]+/", "", text)
+        parts = [part for part in text.split("/") if part]
+        if not parts:
+            return cls._human_label(text)
+        basename = parts[-1]
+        parent = parts[-2] if len(parts) > 1 else ""
+        label = cls._human_label(basename)
+        parent_label = cls._human_label(parent) if parent and parent.lower() not in {"data", "json", "parquet", "duckdb"} else ""
+        return f"{parent_label} - {label}" if parent_label and parent_label not in label else label
