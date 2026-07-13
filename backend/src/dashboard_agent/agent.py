@@ -12,6 +12,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from dashboard_agent.config import Settings
+from dashboard_agent.dashboard_planner import build_complex_dashboard
 from dashboard_agent.dashboard_widget import dataset_summaries, graph_dashboard_marker
 
 
@@ -47,6 +48,8 @@ INTENT_SYNONYMS = {
     "institute": {"institution", "school", "organization", "name"},
     "institution": {"institute", "school", "organization", "name"},
     "school": {"institute", "institution", "organization", "name"},
+    "id": {"ids"},
+    "ids": {"id"},
 }
 DASHBOARD_BUILDING_INSTRUCTIONS = (
     "Build dashboards for the user's data domain, not for graph internals. "
@@ -381,7 +384,6 @@ QUERY_DIMENSION_STOP_TERMS = {
     "highest",
     "largest",
     "learn",
-    "learning",
     "many",
     "max",
     "most",
@@ -392,7 +394,6 @@ QUERY_DIMENSION_STOP_TERMS = {
     "reading",
     "result",
     "show",
-    "status",
     "total",
     "user",
     "users",
@@ -408,8 +409,13 @@ QUERY_DIMENSION_STOP_TERMS = {
 def _query_dimension_phrases(question: str) -> list[str]:
     lowered = f" {question.lower()} "
     phrase_patterns = [
-        r"\b(?:by|per|grouped by|group by|split by|breakdown by|compare by)\s+([a-z0-9 _-]+)",
+        r"\b(?:grouped by|group by|split by|breakdown by|compare by|by|per)\s+([a-z0-9 _-]+)",
         r"\bdistribution of\s+([a-z0-9 _-]+)",
+        r"\bshow\s+([a-z0-9 _-]+?)\s+distribution\b",
+        r"\b([a-z0-9 _-]+?)\s+distribution\b",
+        r"\b(?:which|what)\s+([a-z0-9 _-]+?)\s+(?:has|have|had|contains?|includes?)\b",
+        r"\bcompare\s+([a-z0-9 _-]+)",
+        r"\bshow\s+([a-z0-9 _-]+?)\s+by\b",
         r"\b(?:top|most|highest|largest)\s+([a-z0-9 _-]+?)\s+by\b",
     ]
     phrases: list[str] = []
@@ -436,6 +442,54 @@ def _query_dimension_terms(question: str) -> set[str]:
         return terms - QUERY_DIMENSION_STOP_TERMS
     fallback = set(_intent_terms(question)) - QUERY_DIMENSION_STOP_TERMS
     return fallback
+
+
+def _primary_group_dimension_terms(question: str) -> set[str]:
+    lowered = f" {question.lower()} "
+    phrases: list[str] = []
+    for pattern in (
+        r"\b(?:grouped by|group by|split by|breakdown by|by|per)\s+([a-z0-9 _-]+)",
+    ):
+        for match in re.finditer(pattern, lowered):
+            phrase = re.split(
+                r"\b(?:after|and|compare|for|from|having|that|to|where|when|which|who|with)\b",
+                match.group(1),
+                maxsplit=1,
+            )[0]
+            phrase = re.sub(r"\b(?:user|users|student|students|learner|learners|number|count|total)\b", " ", phrase)
+            phrase = re.sub(r"[^a-z0-9 _-]+", " ", phrase)
+            phrase = re.sub(r"\s+", " ", phrase).strip()
+            if phrase:
+                phrases.append(phrase)
+    terms: set[str] = set()
+    for phrase in phrases:
+        terms.update(_intent_terms(phrase))
+    return terms - QUERY_DIMENSION_STOP_TERMS
+
+
+def _primary_ranked_dimension_terms(question: str) -> set[str]:
+    lowered = f" {question.lower()} "
+    patterns = [
+        r"\b(?:which|what)\s+([a-z0-9 _-]+?)\s+(?:has|have|had|contains?|includes?)\b",
+        r"\b(?:top|most|highest|largest)\s+([a-z0-9 _-]+?)\s+by\b",
+        r"\bshow\s+([a-z0-9 _-]+?)\s+by\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        phrase = re.split(
+            r"\b(?:after|and|compare|for|from|having|that|to|where|when|which|who|with)\b",
+            match.group(1),
+            maxsplit=1,
+        )[0]
+        phrase = re.sub(r"\b(?:user|users|student|students|learner|learners|number|count|total)\b", " ", phrase)
+        phrase = re.sub(r"[^a-z0-9 _-]+", " ", phrase)
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+        terms = set(_intent_terms(phrase)) - QUERY_DIMENSION_STOP_TERMS
+        if terms:
+            return terms
+    return set()
 
 
 def _field_terms(field: str) -> set[str]:
@@ -983,6 +1037,9 @@ def _duckdb_activity_context(store: Any, question: str) -> dict[str, Any]:
 
 def _graph_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]:
     lowered = question.lower()
+    wants_time = "time" in lowered or "trend" in lowered or "over time" in lowered or "overtime" in lowered
+    if wants_time:
+        return {}
     if not any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank")):
         return {}
     if _needs_duckdb_filter(question):
@@ -1923,6 +1980,9 @@ def _ranked_dimension_activity_from_payload(
 
 def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]:
     lowered = question.lower()
+    wants_time = "time" in lowered or "trend" in lowered or "over time" in lowered or "overtime" in lowered
+    if wants_time:
+        return {}
     wants_grouped = " by " in lowered and any(term in lowered for term in ("user", "users", "student", "learner", "course"))
     wants_rank = any(term in lowered for term in ("most", "top", "highest", "largest", "max", "rank")) or wants_grouped
     if not wants_rank:
@@ -2035,6 +2095,40 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
                 "data": chart_data,
             }
         ]
+        split_slot = _duckdb_split_dimension_slot(
+            con,
+            table,
+            question,
+            dimension=dimension,
+            measure=measure,
+            extra_where=extra_where,
+            params=filter_params,
+        )
+        if split_slot:
+            chart_slots.insert(0, split_slot)
+            layout_spec["chartTitle"] = split_slot.get("title") or layout_spec.get("chartTitle")
+            layout_spec["blocks"] = _replace_primary_chart_block(
+                layout_spec.get("blocks"),
+                old_slot_id=slot_id,
+                new_slot_id=str(split_slot["id"]),
+            )
+        if not split_slot:
+            chart_slots.extend(
+                _duckdb_companion_dimension_slots(
+                    con,
+                    table,
+                    question,
+                    measure=measure,
+                    excluded_dimensions={dimension},
+                    extra_where=extra_where,
+                    params=filter_params,
+                    primary_dimension=dimension if _should_scope_companion_to_primary(question) else None,
+                    primary_value=top_label if _should_scope_companion_to_primary(question) else None,
+                    max_slots=3,
+                )
+            )
+        if len(chart_slots) > 1 and not split_slot:
+            layout_spec["blocks"] = _extend_layout_blocks_with_slots(layout_spec.get("blocks"), chart_slots[1:], max_blocks=8)
         decision_trace = _ranked_decision_trace(
             question=question,
             source_kind="duckdb",
@@ -2112,6 +2206,7 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
         ).fetchall()
     ]
     intent_terms = set(_intent_terms(_expand_ranked_query_terms(question)))
+    primary_dimension_terms = _primary_ranked_dimension_terms(question)
     measure_terms = _measure_terms(question)
     requires_filter = _needs_duckdb_filter(question)
     candidates: list[tuple[float, str, str, str]] = []
@@ -2125,6 +2220,11 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
         dimension_columns = [column for column in columns if _is_dimension_column(column)]
         for dimension in dimension_columns:
             dimension_score = _ranked_dimension_score(dimension, intent_terms, question)
+            if primary_dimension_terms:
+                primary_overlap = _field_terms(dimension) & primary_dimension_terms
+                if not primary_overlap:
+                    continue
+                dimension_score += float(len(primary_overlap) * 30)
             if dimension_score <= 0:
                 continue
             for measure in measure_columns:
@@ -2132,6 +2232,14 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
                 if measure_score <= 0:
                     continue
                 table_score = 1.0 if "fact" in table or "joined" in table else 0.0
+                table_score += _secondary_dimension_table_score(
+                    con,
+                    table,
+                    columns,
+                    question,
+                    measure=measure,
+                    excluded={dimension, measure},
+                )
                 if "name" in intent_terms and "name" in _field_terms(dimension):
                     dimension_score += 2.0
                 candidates.append((dimension_score + measure_score + table_score, table, dimension, measure))
@@ -2140,6 +2248,707 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
         if _ranked_dimension_has_values(con, table, dimension, measure):
             return {"table": table, "dimension": dimension, "measure": measure}
     return {}
+
+
+def _secondary_dimension_table_score(
+    con: Any,
+    table: str,
+    columns: list[str],
+    question: str,
+    *,
+    measure: str,
+    excluded: set[str],
+) -> float:
+    lowered = question.lower()
+    if not any(term in lowered for term in (" and ", "also", "compare", "composition", "distribution", "breakdown", "split", "inside", "within")):
+        return 0.0
+    focus_terms = _query_dimension_terms(question)
+    if not focus_terms:
+        return 0.0
+    score = 0.0
+    for column in columns:
+        if column in excluded or not _is_dimension_column(column):
+            continue
+        field_terms = _field_terms(column)
+        overlap = field_terms & focus_terms
+        if overlap:
+            if _ranked_dimension_has_values(con, table, column, measure):
+                score += min(float(len(overlap) * 3), 9.0)
+            else:
+                score -= 3.0
+    return min(score, 12.0)
+
+
+def _extend_layout_blocks_with_slots(
+    blocks: Any,
+    slots: list[dict[str, Any]],
+    *,
+    max_blocks: int = 8,
+) -> list[dict[str, Any]]:
+    result = [dict(block) for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+    existing = {str(block.get("slotId")) for block in result if block.get("type") == "chart" and block.get("slotId")}
+    for slot in slots:
+        slot_id = str(slot.get("id") or "")
+        if not slot_id or slot_id in existing or not slot.get("data"):
+            continue
+        result.append({"type": "chart", "slotId": slot_id, "span": 2})
+        existing.add(slot_id)
+        if len(result) >= max_blocks:
+            break
+    return result[:max_blocks]
+
+
+def _replace_primary_chart_block(blocks: Any, *, old_slot_id: str, new_slot_id: str) -> list[dict[str, Any]]:
+    result = [dict(block) for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+    replaced = False
+    for block in result:
+        if block.get("type") == "chart" and block.get("slotId") == old_slot_id:
+            block["slotId"] = new_slot_id
+            block["span"] = 2
+            replaced = True
+            break
+    if not replaced:
+        result.append({"type": "chart", "slotId": new_slot_id, "span": 2})
+    return result[:8]
+
+
+def _split_dimension_terms(question: str) -> set[str]:
+    lowered = f" {question.lower()} "
+    for pattern in (
+        r"\b(?:split by|breakdown by|grouped by|group by)\s+([a-z0-9 _-]+)",
+        r"\b(?:split|breakdown|group)\s+.+?\s+by\s+([a-z0-9 _-]+)",
+    ):
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        phrase = re.split(
+            r"\b(?:after|and|compare|for|from|having|that|to|where|when|which|who|with)\b",
+            match.group(1),
+            maxsplit=1,
+        )[0]
+        phrase = re.sub(r"\b(?:user|users|student|students|learner|learners|number|count|total)\b", " ", phrase)
+        phrase = re.sub(r"[^a-z0-9 _-]+", " ", phrase)
+        phrase = re.sub(r"\s+", " ", phrase).strip()
+        terms = set(_intent_terms(phrase)) - QUERY_DIMENSION_STOP_TERMS
+        if terms:
+            return terms
+    return set()
+
+
+def _split_dimension_for_prompt(columns: list[str], question: str, *, excluded: set[str]) -> str:
+    split_terms = _split_dimension_terms(question)
+    if not split_terms:
+        return ""
+    candidates: list[tuple[float, str]] = []
+    for column in columns:
+        if column in excluded or not _is_dimension_column(column):
+            continue
+        field_terms = _field_terms(column)
+        overlap = field_terms & split_terms
+        if not overlap:
+            continue
+        candidates.append((float(len(overlap) * 10) + _ranked_dimension_score(column, split_terms, question), column))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return candidates[0][1] if candidates else ""
+
+
+def _duckdb_split_dimension_slot(
+    con: Any,
+    table: str,
+    question: str,
+    *,
+    dimension: str,
+    measure: str,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return {}
+    split_dimension = _split_dimension_for_prompt(columns, question, excluded={dimension, measure})
+    if not split_dimension:
+        return {}
+    dimension_expr = _duckdb_quote_identifier(dimension)
+    split_expr = _duckdb_quote_identifier(split_dimension)
+    measure_expr = _duckdb_quote_identifier(measure)
+    query_params = list(params or [])
+    try:
+        rows = con.execute(
+            f"""
+            with top_dimensions as (
+                select cast({dimension_expr} as varchar) as label, count(distinct {measure_expr}) as total_value
+                from {_duckdb_quote_identifier(table)}
+                where {dimension_expr} is not null
+                  and cast({dimension_expr} as varchar) <> ''
+                  and lower(cast({dimension_expr} as varchar)) not in ('unknown', 'none', 'null')
+                  and {split_expr} is not null
+                  and cast({split_expr} as varchar) <> ''
+                  and {measure_expr} is not null
+                  {extra_where}
+                group by 1
+                order by total_value desc, label
+                limit 8
+            )
+            select
+                cast(t.{dimension_expr} as varchar) as label,
+                cast(t.{split_expr} as varchar) as series,
+                count(distinct t.{measure_expr}) as value
+            from {_duckdb_quote_identifier(table)} t
+            join top_dimensions d on cast(t.{dimension_expr} as varchar) = d.label
+            where t.{dimension_expr} is not null
+              and cast(t.{dimension_expr} as varchar) <> ''
+              and t.{split_expr} is not null
+              and cast(t.{split_expr} as varchar) <> ''
+              and t.{measure_expr} is not null
+              {extra_where}
+            group by 1, 2
+            order by max(d.total_value) desc, label, value desc, series
+            """,
+            [*query_params, *query_params],
+        ).fetchall()
+    except Exception:
+        return {}
+    data = [
+        {"label": str(label), "series": str(series), "value": int(value or 0)}
+        for label, series, value in rows
+        if label not in (None, "") and series not in (None, "")
+    ]
+    if not data:
+        return {}
+    dimension_label = _dimension_display_name(dimension, question)
+    split_label = _dimension_display_name(split_dimension, question)
+    measure_label = _measure_display_name(measure)
+    return {
+        "id": f"split-{_slot_safe_field(dimension)}-by-{_slot_safe_field(split_dimension)}",
+        "title": f"{measure_label} by {dimension_label} split by {split_label}",
+        "chartType": "stacked_bar",
+        "field": dimension,
+        "splitField": split_dimension,
+        "reason": f"Split chart keeps {dimension_label} as the main dimension and separates values by {split_label}.",
+        "data": data,
+    }
+
+
+def _duckdb_dimension_rows(
+    con: Any,
+    table: str,
+    dimension: str,
+    measure: str,
+    *,
+    extra_where: str = "",
+    params: list[Any] | None = None,
+    primary_dimension: str | None = None,
+    primary_value: str | None = None,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    dimension_expr = _duckdb_quote_identifier(dimension)
+    measure_expr = _duckdb_quote_identifier(measure)
+    where_sql = f"""
+        where {dimension_expr} is not null
+          and cast({dimension_expr} as varchar) <> ''
+          and lower(cast({dimension_expr} as varchar)) not in ('unknown', 'none', 'null')
+          and {measure_expr} is not null
+          {extra_where}
+    """
+    query_params = list(params or [])
+    if primary_dimension and primary_value not in (None, ""):
+        where_sql += f"\n          and cast({_duckdb_quote_identifier(primary_dimension)} as varchar) = ?"
+        query_params.append(str(primary_value))
+    rows = con.execute(
+        f"""
+        select cast({dimension_expr} as varchar) as label, count(distinct {measure_expr}) as value
+        from {_duckdb_quote_identifier(table)}
+        {where_sql}
+        group by 1
+        order by value desc, label
+        limit ?
+        """,
+        [*query_params, int(limit)],
+    ).fetchall()
+    return [{"label": str(label), "value": int(value or 0)} for label, value in rows]
+
+
+def _should_scope_companion_to_primary(question: str) -> bool:
+    lowered = question.lower()
+    return any(term in lowered for term in ("inside", "within", "in that", "for that", "of that", "there"))
+
+
+def _duckdb_companion_dimension_slots(
+    con: Any,
+    table: str,
+    question: str,
+    *,
+    measure: str,
+    excluded_dimensions: set[str],
+    extra_where: str = "",
+    params: list[Any] | None = None,
+    primary_dimension: str | None = None,
+    primary_value: str | None = None,
+    max_slots: int = 3,
+) -> list[dict[str, Any]]:
+    lowered = question.lower()
+    wants_companion = any(
+        term in lowered
+        for term in (
+            " and ",
+            " also ",
+            "compare",
+            "composition",
+            "distribution",
+            "breakdown",
+            "split",
+            "inside",
+            "within",
+            "by ",
+        )
+    )
+    if not wants_companion:
+        return []
+    try:
+        columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+    except Exception:
+        return []
+    intent_terms = set(_intent_terms(question))
+    raw_candidates: list[tuple[float, bool, str]] = []
+    for column in columns:
+        if column in excluded_dimensions or column == measure or not _is_dimension_column(column):
+            continue
+        score = _ranked_dimension_score(column, intent_terms, question)
+        exact_match = _dimension_matches_requested_phrase(column, question)
+        if exact_match:
+            score += 100.0
+        if _field_terms(column) & {"status", "type", "category", "province", "school", "institute", "course", "level"}:
+            score += 1.0
+        if score <= 0:
+            continue
+        raw_candidates.append((score, exact_match, column))
+    exact_candidates = [item for item in raw_candidates if item[1]]
+    candidates = exact_candidates or raw_candidates
+    candidates.sort(key=lambda item: (-item[0], item[2]))
+    slots: list[dict[str, Any]] = []
+    used: set[str] = set()
+    measure_label = _measure_display_name(measure)
+    for _score, exact_match, dimension in candidates:
+        if dimension in used:
+            continue
+        try:
+            rows = _duckdb_dimension_rows(
+                con,
+                table,
+                dimension,
+                measure,
+                extra_where=extra_where,
+                params=params,
+                primary_dimension=primary_dimension,
+                primary_value=primary_value,
+            )
+        except Exception:
+            continue
+        if len(rows) < 2 and not exact_match:
+            continue
+        dimension_label = _dimension_display_name(dimension, question)
+        slot_id = f"companion-{_slot_safe_field(dimension)}-by-{_slot_safe_field(measure)}"
+        if primary_dimension and primary_value not in (None, ""):
+            primary_label = _dimension_display_name(primary_dimension, question)
+            title = f"{dimension_label} within top {primary_label}"
+            reason = f"Companion chart answers the secondary dimension requested in the prompt within the leading {primary_label}."
+        else:
+            title = f"{measure_label} by {dimension_label}"
+            reason = "Companion chart answers an additional dimension requested in the same prompt."
+        slots.append(
+            {
+                "id": slot_id,
+                "title": title,
+                "chartType": _chart_type_for_count_field(dimension, rows, question) if len(rows) > 1 else "stat",
+                "field": dimension,
+                "reason": reason,
+                "data": rows,
+            }
+        )
+        used.add(dimension)
+        if len(slots) >= max_slots:
+            break
+    return slots
+
+
+def _dimension_matches_requested_phrase(column: str, question: str) -> bool:
+    field_terms = _field_terms(column)
+    if not field_terms:
+        return False
+    primary_terms = _primary_ranked_dimension_terms(question) | _primary_group_dimension_terms(question)
+    for phrase in _query_dimension_phrases(question):
+        phrase_terms = set(_intent_terms(phrase)) - QUERY_DIMENSION_STOP_TERMS
+        if primary_terms and phrase_terms and phrase_terms <= primary_terms:
+            continue
+        if phrase_terms and phrase_terms <= field_terms:
+            return True
+    return False
+
+
+def _time_column_score(column: str, question: str) -> float:
+    lowered = column.lower()
+    terms = _field_terms(column)
+    score = 0.0
+    if "date" in terms or "time" in terms or "timestamp" in terms:
+        score += 6.0
+    if "activity" in lowered or "last" in terms:
+        score += 3.0
+    if "enroll" in lowered:
+        score += 2.0
+    if "cert" in lowered or "certificate" in lowered:
+        score += 2.0
+    query = question.lower()
+    if any(term in query for term in ("finish", "finished", "complete", "completed", "pass", "passed", "certificate")):
+        if "cert" in lowered or "complete" in lowered or "pass" in lowered:
+            score += 5.0
+        if "last" in terms or "activity" in lowered:
+            score += 2.0
+    if any(term in query for term in ("activity", "active", "read", "reading", "learn", "learning")):
+        if "activity" in lowered or "last" in terms:
+            score += 5.0
+    return score
+
+
+def _is_time_column(column: str, column_type: str, question: str) -> bool:
+    lowered_type = column_type.lower()
+    if "date" in lowered_type or "time" in lowered_type:
+        return True
+    return _time_column_score(column, question) > 0
+
+
+def _grouped_time_series_plan(con: Any, question: str) -> dict[str, str]:
+    tables = [
+        str(row[0])
+        for row in con.execute(
+            """
+            select table_name
+            from information_schema.tables
+            where table_schema = 'main'
+              and table_name like 'dashboard_agent_%'
+            order by table_name
+            """
+        ).fetchall()
+    ]
+    primary_dimension_terms = _primary_group_dimension_terms(question)
+    dimension_terms = primary_dimension_terms or _query_dimension_terms(question)
+    measure_terms = _measure_terms(question)
+    candidates: list[tuple[float, str, str, str, str]] = []
+    for table in tables:
+        if any(skip in table for skip in ("cache", "map")):
+            continue
+        pragma_rows = con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()
+        columns = [(str(row[1]), str(row[2])) for row in pragma_rows]
+        time_columns = [column for column, column_type in columns if _is_time_column(column, column_type, question)]
+        dimension_columns = [
+            column
+            for column, _column_type in columns
+            if _is_dimension_column(column) or _dimension_field_score(column, question, set(_intent_terms(question))) > 0
+        ]
+        measure_columns = [column for column, _column_type in columns if _is_measure_column(column, measure_terms)]
+        for dimension in dimension_columns:
+            dimension_score = _dimension_field_score(dimension, question, set(_intent_terms(question)))
+            if primary_dimension_terms:
+                primary_overlap = _field_terms(dimension) & primary_dimension_terms
+                if not primary_overlap:
+                    continue
+                dimension_score += float(len(primary_overlap) * 20)
+            if dimension_terms and not (_field_terms(dimension) & dimension_terms) and dimension_score <= 0:
+                continue
+            for time_column in time_columns:
+                time_score = _time_column_score(time_column, question)
+                if time_score <= 0:
+                    continue
+                for measure in measure_columns:
+                    measure_score = _ranked_measure_score(measure, measure_terms)
+                    if measure_score <= 0:
+                        continue
+                    if not _grouped_time_series_has_values(con, table, time_column, dimension, measure):
+                        continue
+                    table_score = 4.0 if "fact" in table or "joined" in table else 0.0
+                    candidates.append((dimension_score + time_score + measure_score + table_score, table, time_column, dimension, measure))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3], item[4]))
+    return {"table": candidates[0][1], "time": candidates[0][2], "dimension": candidates[0][3], "measure": candidates[0][4]} if candidates else {}
+
+
+def _grouped_time_series_has_values(con: Any, table: str, time_column: str, dimension: str, measure: str) -> bool:
+    try:
+        value = con.execute(
+            f"""
+            select count(*)
+            from {_duckdb_quote_identifier(table)}
+            where {_duckdb_quote_identifier(time_column)} is not null
+              and {_duckdb_quote_identifier(dimension)} is not null
+              and cast({_duckdb_quote_identifier(dimension)} as varchar) <> ''
+              and {_duckdb_quote_identifier(measure)} is not null
+            limit 1
+            """
+        ).fetchone()[0]
+    except Exception:
+        return False
+    return int(value or 0) > 0
+
+
+def _requested_dimension_values(question: str) -> set[str]:
+    lowered = question.lower()
+    values: set[str] = set()
+    known_values = {
+        "passed": ("passed", "pass", "finished", "complete", "completed"),
+        "in_progress": ("in progress", "in-progress", "in_progress"),
+        "inactive": ("inactive",),
+        "active": ("active",),
+    }
+    for canonical, terms in known_values.items():
+        if any(term in lowered for term in terms):
+            values.add(canonical)
+    return values
+
+
+def _dimension_value_matches_request(value: Any, requested_values: set[str]) -> bool:
+    if not requested_values:
+        return True
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in requested_values:
+        return True
+    if normalized == "passed" and {"passed"} & requested_values:
+        return True
+    return False
+
+
+def _duckdb_grouped_time_series_context(store: Any, question: str) -> dict[str, Any]:
+    lowered = question.lower()
+    wants_time = "time" in lowered or "trend" in lowered or "over time" in lowered or "overtime" in lowered
+    wants_group = any(term in lowered for term in (" by ", "group", "split", "breakdown", "compare"))
+    if not (wants_time and wants_group):
+        return {}
+    db_path = _duckdb_database_path(store)
+    if db_path is None or not db_path.exists():
+        return {}
+    try:
+        import duckdb
+    except ImportError:
+        return {}
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return {}
+    try:
+        plan = _grouped_time_series_plan(con, question)
+        if not plan:
+            return {}
+        table = plan["table"]
+        time_column = plan["time"]
+        dimension = plan["dimension"]
+        measure = plan["measure"]
+        time_expr = _duckdb_quote_identifier(time_column)
+        dimension_expr = _duckdb_quote_identifier(dimension)
+        measure_expr = _duckdb_quote_identifier(measure)
+        requested_group_values = _requested_dimension_values(question)
+        if requested_group_values and (_field_terms(dimension) & {"status", "result", "pass", "passed", "complete", "completed", "learning"}):
+            extra_where, filter_params, filter_labels = "", [], []
+        else:
+            extra_where, filter_params, filter_labels = _ranked_filter_sql(con, table, question)
+        group_limit = 50 if requested_group_values else 4
+        top_groups = con.execute(
+            f"""
+            select cast({dimension_expr} as varchar) as label, count(distinct {measure_expr}) as value
+            from {_duckdb_quote_identifier(table)}
+            where {dimension_expr} is not null
+              and cast({dimension_expr} as varchar) <> ''
+              and {time_expr} is not null
+              {extra_where}
+            group by 1
+            order by value desc, label
+            limit {int(group_limit)}
+            """,
+            filter_params,
+        ).fetchall()
+        if requested_group_values:
+            top_groups = [
+                (label, value)
+                for label, value in top_groups
+                if _dimension_value_matches_request(label, requested_group_values)
+            ]
+        if not top_groups:
+            return {}
+        dimension_label = _dimension_display_name(dimension, question)
+        measure_label = _measure_display_name(measure)
+        chart_slots: list[dict[str, Any]] = []
+        charts: dict[str, list[dict[str, Any]]] = {}
+        for index, (group_label, _group_value) in enumerate(top_groups):
+            rows = con.execute(
+                f"""
+                with grouped as (
+                    select
+                        date_trunc('month', {time_expr}) as bucket,
+                        count(distinct {measure_expr}) as value
+                    from {_duckdb_quote_identifier(table)}
+                    where {dimension_expr} is not null
+                      and cast({dimension_expr} as varchar) = ?
+                      and {time_expr} is not null
+                      {extra_where}
+                    group by 1
+                    order by bucket
+                ),
+                numbered as (
+                    select
+                        bucket,
+                        value,
+                        row_number() over (order by bucket) as rn,
+                        count(*) over () as total_rows
+                    from grouped
+                ),
+                sampled as (
+                    select
+                        *,
+                        case
+                            when total_rows <= 18 then rn
+                            when rn = 1 then 1
+                            when rn = total_rows then 18
+                            else 2 + cast(floor(((rn - 2) * 16.0) / greatest(total_rows - 2, 1)) as integer)
+                        end as sample_bucket
+                    from numbered
+                ),
+                bucketed as (
+                    select *, row_number() over (partition by sample_bucket order by rn) as bucket_rank
+                    from sampled
+                )
+                select strftime(bucket, '%Y-%m') as label, value
+                from bucketed
+                where bucket_rank = 1
+                order by label
+                """,
+                [str(group_label), *filter_params],
+            ).fetchall()
+            data = [{"label": str(label), "value": int(value or 0)} for label, value in rows]
+            if not data:
+                continue
+            slot_id = f"groupedTime-{_slot_safe_field(dimension)}-{index}"
+            title = f"{measure_label} over time - {group_label}"
+            slot = {
+                "id": slot_id,
+                "title": title,
+                "chartType": "line",
+                "field": f"{measure}@{time_column}|{dimension}",
+                "reason": f"A grouped time-series line chart tracks distinct {_humanize_field(measure)} over {_humanize_field(time_column)} by {_humanize_field(dimension)}.",
+                "data": data,
+            }
+            chart_slots.append(slot)
+            charts[slot_id] = data
+        if not chart_slots:
+            return {}
+        companion_slots: list[dict[str, Any]] = []
+        chart_slots.extend(companion_slots)
+        for slot in companion_slots:
+            charts[str(slot["id"])] = slot.get("data") or []
+        columns = [str(row[1]) for row in con.execute(f"pragma table_info({_duckdb_quote_identifier(table)})").fetchall()]
+        source_paths = _infer_source_paths_for_table(con, table, columns, question=question, fields=[dimension, measure, time_column])
+        source_samples = _source_sample_records(con, source_paths, limit_per_source=50)
+        total_measure = int(
+            con.execute(
+                f"""
+                select count(distinct {measure_expr})
+                from {_duckdb_quote_identifier(table)}
+                where {time_expr} is not null
+                  {extra_where}
+                """,
+                filter_params,
+            ).fetchone()[0]
+            or 0
+        )
+        total_records = int(
+            con.execute(
+                f"""
+                select count(*)
+                from {_duckdb_quote_identifier(table)}
+                where {time_expr} is not null
+                  {extra_where}
+                """,
+                filter_params,
+            ).fetchone()[0]
+            or 0
+        )
+        total_dimensions = int(
+            con.execute(
+                f"""
+                select count(distinct {dimension_expr})
+                from {_duckdb_quote_identifier(table)}
+                where {dimension_expr} is not null
+                  and {time_expr} is not null
+                  {extra_where}
+                """,
+                filter_params,
+            ).fetchone()[0]
+            or 0
+        )
+        decision_trace = _time_series_decision_trace(
+            question=question,
+            source_kind="duckdb",
+            table=table,
+            source_paths=source_paths,
+            chart_slots=chart_slots,
+            total_records=total_records,
+            total_users=total_measure,
+        )
+        activity = {
+            "datasets": {
+                table: {
+                    "source": table,
+                    "key": table,
+                    "source_paths": source_paths,
+                    "source_samples": source_samples,
+                    "object_type": "duckdb_grouped_time_series",
+                    "sampleRecords": sum(len(slot.get("data") or []) for slot in chart_slots),
+                    "totalRecords": total_records,
+                    "isFullAggregate": True,
+                }
+            },
+            "records": [
+                {"source": table, "series": str(label), dimension: str(label), measure: int(value or 0)}
+                for label, value in top_groups
+            ],
+            "chartPlan": [{key: value for key, value in slot.items() if key != "data"} for slot in chart_slots],
+            "chartSlots": chart_slots,
+            "charts": charts,
+            "decisionTrace": decision_trace,
+            "summary": {
+                "source": table,
+                "sourcePaths": source_paths,
+                "sourceSamples": source_samples,
+                "sampleRecords": sum(len(slot.get("data") or []) for slot in chart_slots),
+                "totalRecords": total_records,
+                "isFullAggregate": True,
+                "distinctUsers": total_measure,
+                "topDimensionField": dimension,
+                "topDimensionName": dimension_label,
+                "measureField": measure,
+                "measureName": measure_label,
+                "totalDistinctMeasure": total_measure,
+                "distinctDimensionValues": total_dimensions,
+                "filters": filter_labels,
+                "metricLabels": {
+                    "totalDistinctMeasure": f"Total {measure_label}",
+                    "distinctDimensionValues": f"{dimension_label} groups",
+                },
+            },
+            "layoutSpec": {
+                "title": f"{measure_label} over time by {dimension_label}",
+                "subtitle": f"Shows distinct {measure_label} over time grouped by {dimension_label}.",
+                "blocks": [
+                    {"type": "metric", "id": "totalDistinctMeasure", "span": 1},
+                    {"type": "metric", "id": "distinctDimensionValues", "span": 1},
+                    *[
+                        {"type": "chart", "slotId": str(slot["id"]), "span": 2}
+                        for slot in chart_slots[:4]
+                    ],
+                ],
+            },
+        }
+        return activity
+    except Exception:
+        return {}
+    finally:
+        con.close()
 
 
 def _expand_ranked_query_terms(question: str) -> str:
@@ -3327,6 +4136,163 @@ def _llm_activity_layout_spec(
     return None
 
 
+def _supported_chart_types(slot: dict[str, Any]) -> set[str]:
+    data = slot.get("data") if isinstance(slot.get("data"), list) else []
+    has_series = any(isinstance(item, dict) and item.get("series") for item in data)
+    current = str(slot.get("chartType") or "")
+    if has_series:
+        if current in {"line", "area", "multi_line"} or "time" in str(slot.get("field") or "").lower() or "date" in str(slot.get("field") or "").lower():
+            return {"multi_line", "stacked_column", "stacked_bar"}
+        return {"stacked_bar", "stacked_column", "multi_line"}
+    count = len(data)
+    if count <= 1:
+        return {"stat", "horizontal_bar"}
+    if current in {"line", "area"}:
+        return {"line", "area", "column"}
+    supported = {"horizontal_bar", "column"}
+    if 2 <= count <= 8:
+        supported.update({"donut", "pie", "radial_bar"})
+    if 3 <= count <= 8:
+        supported.add("radar")
+    if 2 <= count <= 10:
+        supported.add("funnel")
+    if 3 <= count <= 20:
+        supported.add("treemap")
+    return supported
+
+
+def _apply_chart_type_choices(activity: dict[str, Any], choices: Any) -> dict[str, Any]:
+    if not isinstance(choices, dict):
+        return activity
+    slots = activity.get("chartSlots") if isinstance(activity.get("chartSlots"), list) else []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        requested = str(choices.get(str(slot.get("id"))) or "")
+        if requested not in _supported_chart_types(slot):
+            continue
+        slot["chartType"] = requested
+        slot["reason"] = f"{slot.get('reason') or ''} LLM selected {requested} from the compatible chart types.".strip()
+    activity["chartPlan"] = [
+        {key: value for key, value in slot.items() if key != "data"}
+        for slot in slots
+        if isinstance(slot, dict)
+    ]
+    return activity
+
+
+def _prompt_chart_type_choice(question: str) -> str:
+    lowered = question.lower()
+    chart_phrases = {
+        "multi_line": ("multi line", "multiple lines"),
+        "stacked_column": ("stacked column", "stacked vertical"),
+        "stacked_bar": ("stacked bar", "split bar"),
+        "horizontal_bar": ("horizontal bar",),
+        "radial_bar": ("radial bar", "circular bar"),
+        "donut": ("donut", "ring chart"),
+        "pie": ("pie chart", " as pie", " pie "),
+        "treemap": ("treemap", "tree map"),
+        "radar": ("radar", "spider chart"),
+        "funnel": ("funnel",),
+        "area": ("area chart",),
+        "line": ("line chart",),
+        "column": ("column chart", "vertical bar"),
+    }
+    padded = f" {lowered} "
+    for chart_type, phrases in chart_phrases.items():
+        if any(phrase in padded for phrase in phrases):
+            return chart_type
+    return ""
+
+
+def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> dict[str, Any]:
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    slots = activity.get("chartSlots") if isinstance(activity.get("chartSlots"), list) else []
+    if not slots or get_settings().llm_mode == "never":
+        return activity
+    explicit_chart_type = _prompt_chart_type_choice(question)
+    if explicit_chart_type:
+        _apply_chart_type_choices(
+            activity,
+            {
+                str(slot.get("id")): explicit_chart_type
+                for slot in slots
+                if isinstance(slot, dict) and explicit_chart_type in _supported_chart_types(slot)
+            },
+        )
+        return activity
+    candidates = _llm_candidates()
+    if not candidates:
+        return activity
+    from langchain_openai import ChatOpenAI
+
+    slot_context = [
+        {
+            "id": slot.get("id"),
+            "title": slot.get("title"),
+            "field": slot.get("field"),
+            "splitField": slot.get("splitField"),
+            "rows": len(slot.get("data") or []),
+            "hasSeries": any(isinstance(item, dict) and item.get("series") for item in slot.get("data") or []),
+            "currentChartType": slot.get("chartType"),
+            "compatibleChartTypes": sorted(_supported_chart_types(slot)),
+        }
+        for slot in slots
+        if isinstance(slot, dict)
+    ]
+    messages = [
+        (
+            "system",
+            (
+                "You are the dashboard visualization planner. Return only JSON with chartTypes, title, and subtitle. "
+                "chartTypes must map each supplied slot id to one compatibleChartTypes value. "
+                "Choose by analytical job: line or area for change over time; multi_line for comparing time series; "
+                "horizontal_bar for ranking and long labels; column for compact comparison; donut or pie for part-to-whole with few categories; "
+                "treemap for hierarchical composition; radar only for comparing a small common profile; radial_bar for a compact circular comparison; "
+                "funnel only for ordered stages; stacked_bar or stacked_column for composition split by a second dimension. "
+                "Prefer the simplest truthful chart and do not use every available type merely for variety."
+            ),
+        ),
+        (
+            "human",
+            json.dumps(
+                {
+                    "question": question,
+                    "analyticalPlan": summary.get("analyticalPlan"),
+                    "chartSlots": slot_context,
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+        ),
+    ]
+    candidate = candidates[0]
+    try:
+        model = ChatOpenAI(
+            api_key=candidate["api_key"],
+            model=candidate["model"],
+            base_url=candidate.get("base_url"),
+            default_headers=candidate.get("headers") or None,
+            temperature=0,
+            timeout=10,
+            max_retries=0,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+        parsed = json.loads(str(model.invoke(messages).content))
+        if not isinstance(parsed, dict):
+            return activity
+        _apply_chart_type_choices(activity, parsed.get("chartTypes"))
+        layout = activity.get("layoutSpec") if isinstance(activity.get("layoutSpec"), dict) else {}
+        if isinstance(parsed.get("title"), str) and parsed["title"].strip():
+            layout["title"] = parsed["title"].strip()[:100]
+        if isinstance(parsed.get("subtitle"), str) and parsed["subtitle"].strip():
+            layout["subtitle"] = parsed["subtitle"].strip()[:180]
+        activity["layoutSpec"] = layout
+    except Exception:
+        return activity
+    return activity
+
+
 def _sanitize_activity_layout_spec(
     spec: dict[str, Any] | None,
     available_slots: set[str],
@@ -3564,14 +4530,19 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
     cache_results = _aggregate_cache_results(store, question)
     results = cache_results + store.search(question, limit=24)
     if _wants_dashboard(question):
+        database_path = _duckdb_database_path(store)
         activity = (
-            _duckdb_ranked_dimension_context(store, question)
-            or _graph_ranked_dimension_context(store, question)
+            (build_complex_dashboard(database_path, question) if database_path else {})
+            or _duckdb_grouped_time_series_context(store, question)
             or _graph_time_series_activity_context(store, question)
+            or _duckdb_ranked_dimension_context(store, question)
+            or _graph_ranked_dimension_context(store, question)
             or _aggregate_cache_activity(store, question)
             or _duckdb_activity_context(store, question)
             or _activity_dashboard_context(store, results, question)
         )
+        if activity:
+            activity = _llm_design_complex_dashboard(question, activity)
         title = "Activity dashboard" if activity else "Dashboard graph"
         answer = graph_dashboard_marker(status=store.status(), results=results, activity=activity, title=title)
     else:

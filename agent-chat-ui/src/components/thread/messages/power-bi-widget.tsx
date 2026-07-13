@@ -20,10 +20,20 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  Funnel,
+  FunnelChart,
+  LabelList,
+  Legend,
   Line,
   LineChart,
   Pie,
   PieChart,
+  PolarAngleAxis,
+  PolarGrid,
+  Radar,
+  RadarChart,
+  RadialBar,
+  RadialBarChart,
   ResponsiveContainer,
   Tooltip,
   Treemap,
@@ -33,6 +43,7 @@ import {
 
 type ChartDatum = {
   label: string;
+  series?: string;
   value?: number;
   score?: number;
 };
@@ -113,6 +124,7 @@ type ChartSlot = {
   title: string;
   chartType: string;
   field: string;
+  splitField?: string;
   reason?: string;
   data: ChartDatum[];
 };
@@ -713,7 +725,7 @@ function MetricCard({
           <Icon className="h-4 w-4" aria-hidden="true" />
         </div>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">{hint}</p>
+      <p className="mt-2 truncate text-xs text-muted-foreground" title={hint}>{hint}</p>
     </div>
   );
 }
@@ -798,6 +810,235 @@ function MiniColumnChart({ data, title }: { data: ChartDatum[]; title: string })
             <Bar dataKey="value" radius={[6, 6, 0, 0]} fill="#2563eb" />
           </BarChart>
         </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function PieChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data.slice(0, 8).map((item) => ({
+    name: humanLabel(item.label),
+    value: Number(item.value ?? item.score ?? 0),
+  })).filter((item) => item.value > 0);
+  if (!chartData.length) return null;
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie data={chartData} dataKey="value" nameKey="name" outerRadius={88} paddingAngle={2}>
+              {chartData.map((item, index) => <Cell key={item.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+              <LabelList dataKey="name" position="outside" className="fill-foreground text-[10px]" />
+            </Pie>
+            <Tooltip formatter={(value) => formatNumber(value)} />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function RadarChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data.slice(0, 8).map((item) => ({
+    label: humanLabel(item.label),
+    value: Number(item.value ?? item.score ?? 0),
+  }));
+  if (chartData.length < 3) return null;
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <RadarChart data={chartData} outerRadius="72%">
+            <PolarGrid />
+            <PolarAngleAxis dataKey="label" tick={{ fontSize: 10 }} />
+            <Radar dataKey="value" stroke="#2563eb" fill="#2563eb" fillOpacity={0.3} />
+            <Tooltip formatter={(value) => formatNumber(value)} />
+          </RadarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function RadialBarChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data.slice(0, 6).map((item, index) => ({
+    name: humanLabel(item.label),
+    value: Number(item.value ?? item.score ?? 0),
+    fill: CHART_COLORS[index % CHART_COLORS.length],
+  })).filter((item) => item.value > 0);
+  if (!chartData.length) return null;
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <RadialBarChart data={chartData} innerRadius="18%" outerRadius="92%" startAngle={90} endAngle={-270}>
+            <RadialBar dataKey="value" background cornerRadius={5} />
+            <Legend iconSize={8} layout="vertical" verticalAlign="middle" align="right" />
+            <Tooltip formatter={(value) => formatNumber(value)} />
+          </RadialBarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function FunnelChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chartData = data.slice(0, 8).map((item, index) => ({
+    name: humanLabel(item.label),
+    value: Number(item.value ?? item.score ?? 0),
+    fill: CHART_COLORS[index % CHART_COLORS.length],
+  })).filter((item) => item.value > 0).sort((left, right) => right.value - left.value);
+  if (chartData.length < 2) return null;
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <FunnelChart>
+            <Tooltip formatter={(value) => formatNumber(value)} />
+            <Funnel data={chartData} dataKey="value" nameKey="name" isAnimationActive={false}>
+              <LabelList position="right" fill="currentColor" stroke="none" dataKey="name" />
+            </Funnel>
+          </FunnelChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function seriesChartData(data: ChartDatum[]) {
+  const series = Array.from(new Set(data.map((item) => String(item.series ?? "")).filter(Boolean))).slice(0, 6);
+  const rows = new Map<string, Record<string, string | number>>();
+  data.forEach((item) => {
+    const label = String(item.label ?? "");
+    const seriesName = String(item.series ?? "");
+    if (!label || !seriesName || !series.includes(seriesName)) return;
+    const row = rows.get(label) ?? { label };
+    row[seriesName] = Number(row[seriesName] ?? 0) + Number(item.value ?? item.score ?? 0);
+    rows.set(label, row);
+  });
+  return { series, rows: Array.from(rows.values()) };
+}
+
+function MultiSeriesLineChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chart = seriesChartData(data);
+  if (!chart.rows.length || !chart.series.length) return null;
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={chart.rows} margin={{ top: 8, right: 12, bottom: 8, left: -8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 10 }} minTickGap={24} />
+            <YAxis tick={{ fontSize: 10 }} tickFormatter={formatNumber} width={44} />
+            <Tooltip formatter={(value) => formatNumber(value)} />
+            <Legend iconSize={8} />
+            {chart.series.map((seriesName, index) => (
+              <Line key={seriesName} type="monotone" dataKey={seriesName} stroke={CHART_COLORS[index % CHART_COLORS.length]} strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function StackedColumnChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const chart = seriesChartData(data);
+  if (!chart.rows.length || !chart.series.length) return null;
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
+      <div className="mt-3 h-64">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={chart.rows} margin={{ top: 8, right: 12, bottom: 8, left: -8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 10 }} tickFormatter={compactLabel} />
+            <YAxis tick={{ fontSize: 10 }} tickFormatter={formatNumber} width={44} />
+            <Tooltip formatter={(value) => formatNumber(value)} />
+            <Legend iconSize={8} />
+            {chart.series.map((seriesName, index) => (
+              <Bar key={seriesName} dataKey={seriesName} stackId="total" fill={CHART_COLORS[index % CHART_COLORS.length]} />
+            ))}
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+function StackedBarChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
+  const labels = Array.from(new Set(data.map((item) => String(item.label ?? "")).filter(Boolean))).slice(0, 8);
+  const series = Array.from(new Set(data.map((item) => String(item.series ?? "")).filter(Boolean))).slice(0, 6);
+  const rows = labels.map((label) => {
+    const segments = series.map((seriesName, index) => {
+      const value = data
+        .filter((item) => String(item.label) === label && String(item.series) === seriesName)
+        .reduce((sum, item) => sum + Number(item.value ?? item.score ?? 0), 0);
+      return {
+        series: seriesName,
+        value,
+        color: CHART_COLORS[index % CHART_COLORS.length],
+      };
+    }).filter((segment) => segment.value > 0);
+    return {
+      label,
+      displayLabel: humanLabel(label, "course"),
+      total: segments.reduce((sum, segment) => sum + segment.value, 0),
+      segments,
+    };
+  });
+  const max = Math.max(...rows.map((row) => row.total), 1);
+  if (!rows.length || !series.length) return null;
+
+  return (
+    <div className="rounded-lg border bg-muted/10 p-3">
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {title}
+      </p>
+      <div className="mt-3 space-y-3">
+        {rows.map((row) => (
+          <div key={row.label} className="min-w-0">
+            <div className="mb-1 grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-xs">
+              <span className="block min-w-0 truncate font-medium leading-4" title={row.label}>
+                {row.displayLabel}
+              </span>
+              <span className="whitespace-nowrap text-right text-muted-foreground">{formatNumber(row.total)}</span>
+            </div>
+            <div className="flex h-3 overflow-hidden rounded-full bg-muted">
+              {row.segments.map((segment, index) => (
+                <div
+                  key={`${row.label}-${segment.series}`}
+                  className="h-full"
+                  title={`${humanLabel(segment.series)}: ${formatNumber(segment.value)}`}
+                  style={{
+                    width: `${Math.max(3, (segment.value / max) * 100)}%`,
+                    backgroundColor: segment.color,
+                    borderTopLeftRadius: index === 0 ? 999 : 0,
+                    borderBottomLeftRadius: index === 0 ? 999 : 0,
+                    borderTopRightRadius: index === row.segments.length - 1 ? 999 : 0,
+                    borderBottomRightRadius: index === row.segments.length - 1 ? 999 : 0,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        {series.map((seriesName, index) => (
+          <span key={seriesName} className="inline-flex items-center gap-1">
+            <span
+              className="h-2 w-2 rounded-full"
+              style={{ backgroundColor: CHART_COLORS[index % CHART_COLORS.length] }}
+            />
+            {humanLabel(seriesName)}
+          </span>
+        ))}
       </div>
     </div>
   );
@@ -946,6 +1187,15 @@ function ChartSlotCard({
   };
 }) {
   const kind = slot.field === "courseID" ? "course" : slot.field === "userID" ? "user" : undefined;
+  if (slot.chartType === "multi_line") {
+    return <MultiSeriesLineChartCard data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "stacked_column") {
+    return <StackedColumnChartCard data={slot.data} title={slot.title} />;
+  }
+  if (slot.data.some((item) => item.series)) {
+    return <StackedBarChartCard data={slot.data} title={slot.title} />;
+  }
   if (slot.chartType === "line") {
     return <TimelineChartCard data={slot.data} title={slot.title} />;
   }
@@ -958,8 +1208,23 @@ function ChartSlotCard({
   if (slot.chartType === "donut") {
     return <DonutChartCard data={slot.data} title={slot.title} />;
   }
+  if (slot.chartType === "pie") {
+    return <PieChartCard data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "radar") {
+    return <RadarChartCard data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "radial_bar") {
+    return <RadialBarChartCard data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "funnel") {
+    return <FunnelChartCard data={slot.data} title={slot.title} />;
+  }
   if (slot.chartType === "column") {
     return <MiniColumnChart data={slot.data} title={slot.title} />;
+  }
+  if (slot.chartType === "stacked_bar") {
+    return <StackedBarChartCard data={slot.data} title={slot.title} />;
   }
   if (slot.chartType === "treemap") {
     return <TreemapChartCard data={slot.data} title={slot.title} />;
