@@ -92,7 +92,7 @@ def test_graphify_links_graph_can_replace_store(tmp_path):
     assert stats["graph_kind"] == "graphify"
     assert stats["nodes"] == 2
     assert store.search("student dashboard")[0]["id"] == "dataset::fact_student_course"
-    assert store.neighbors("dataset::fact_student_course") == ["school_name"]
+    assert store.neighbors("dataset::fact_student_course") == ["School Name"]
 
 
 def test_graphify_search_uses_source_file_and_split_identifiers(tmp_path):

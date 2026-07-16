@@ -20,4 +20,4 @@ def test_graph_dashboard_widget_payload_marker():
     assert payload["status"]["nodes"] == 10
     assert payload["results"][0]["path"] == "$.sales"
     assert payload["charts"]["status"][1] == {"label": "Nodes", "value": 10}
-    assert payload["charts"]["results"][0]["label"] == "$.sales"
+    assert payload["charts"]["results"][0]["label"] == "Sales"
