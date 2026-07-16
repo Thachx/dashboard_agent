@@ -122,6 +122,7 @@ class AnalyticalPlan:
     requested_terms: list[str]
     filters: list[FilterSpec] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    graph_hints: dict[str, Any] = field(default_factory=dict)
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -137,10 +138,16 @@ class AnalyticalPlan:
             ],
             "requestedTerms": self.requested_terms,
             "warnings": self.warnings,
+            "graphHints": self.graph_hints,
         }
 
 
-def build_complex_dashboard(database_path: str | Path, question: str) -> dict[str, Any]:
+def build_complex_dashboard(
+    database_path: str | Path,
+    question: str,
+    *,
+    graph_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Plan and execute a validated multi-dimension or multi-table dashboard."""
 
     try:
@@ -156,7 +163,12 @@ def build_complex_dashboard(database_path: str | Path, question: str) -> dict[st
         return {}
     try:
         catalog = _catalog(con)
-        plan = plan_complex_dashboard(catalog, question, value_validator=lambda column: _column_has_value(con, column))
+        plan = plan_complex_dashboard(
+            catalog,
+            question,
+            value_validator=lambda column: _column_has_value(con, column),
+            graph_hints=graph_hints,
+        )
         if plan is None:
             return {}
         plan.filters = _resolve_value_filters(con, catalog, plan, question)
@@ -172,14 +184,26 @@ def plan_complex_dashboard(
     question: str,
     *,
     value_validator: Callable[[ColumnProfile], bool] | None = None,
+    graph_hints: dict[str, Any] | None = None,
 ) -> AnalyticalPlan | None:
     query_terms = _expanded_terms(question)
     requested_ids = bool(query_terms & ID_TERMS)
-    measure = _resolve_measure(catalog, query_terms, _measure_query_terms(question), value_validator=value_validator)
+    graph_hints = graph_hints or {}
+    measure = _resolve_measure(
+        catalog,
+        query_terms,
+        _measure_query_terms(question),
+        value_validator=value_validator,
+        graph_hints=graph_hints,
+    )
     if measure is None:
         return None
 
-    time_dimension = _resolve_time(catalog, query_terms, value_validator=value_validator) if query_terms & TIME_HINTS else None
+    time_dimension = (
+        _resolve_time(catalog, query_terms, value_validator=value_validator, graph_hints=graph_hints)
+        if query_terms & TIME_HINTS
+        else None
+    )
     dimensions = _resolve_dimensions(
         catalog,
         query_terms,
@@ -188,6 +212,7 @@ def plan_complex_dashboard(
         time_dimension=time_dimension,
         allow_identifiers=requested_ids,
         value_validator=value_validator,
+        graph_hints=graph_hints,
     )
     complex_language = any(
         phrase in f" {question.lower()} "
@@ -201,7 +226,7 @@ def plan_complex_dashboard(
     required = [measure, *dimensions]
     if time_dimension is not None:
         required.append(time_dimension)
-    base_table = _select_base_table(catalog, required)
+    base_table = _select_base_table(catalog, required, graph_hints=graph_hints)
     base_columns = catalog[base_table].columns
     measure = base_columns.get(measure.name, measure)
     dimensions = [base_columns.get(column.name, column) for column in dimensions]
@@ -238,6 +263,12 @@ def plan_complex_dashboard(
         joins=joins,
         requested_terms=sorted(query_terms - STOP_TERMS),
         warnings=warnings,
+        graph_hints={
+            "tables": list(graph_hints.get("tables") or [])[:12],
+            "fields": list(graph_hints.get("fields") or [])[:20],
+            "sourcePaths": list(graph_hints.get("sourcePaths") or [])[:12],
+            "evidence": list(graph_hints.get("evidence") or [])[:12],
+        },
     )
 
 
@@ -280,6 +311,7 @@ def _resolve_measure(
     measure_terms: set[str],
     *,
     value_validator: Callable[[ColumnProfile], bool] | None,
+    graph_hints: dict[str, Any],
 ) -> ColumnProfile | None:
     requested = measure_terms or (query_terms & MEASURE_HINTS)
     candidates: list[tuple[float, ColumnProfile]] = []
@@ -290,6 +322,7 @@ def _resolve_measure(
             if value_validator is not None and not value_validator(column):
                 continue
             score = _semantic_overlap(column.terms, requested or query_terms) * 12.0
+            score += _graph_column_hint_score(column, graph_hints)
             if column.name.lower() in {"user_id", "student_id", "learner_id", "course_id"}:
                 score += 4.0
             if "fact" in table.name or "joined" in table.name:
@@ -305,6 +338,7 @@ def _resolve_time(
     query_terms: set[str],
     *,
     value_validator: Callable[[ColumnProfile], bool] | None,
+    graph_hints: dict[str, Any],
 ) -> ColumnProfile | None:
     candidates: list[tuple[float, ColumnProfile]] = []
     for table in catalog.values():
@@ -314,6 +348,7 @@ def _resolve_time(
             if value_validator is not None and not value_validator(column):
                 continue
             score = _semantic_overlap(column.terms, query_terms) * 8.0
+            score += _graph_column_hint_score(column, graph_hints)
             if "activity" in column.terms or "complete" in column.terms or "completed" in column.terms:
                 score += 3.0
             candidates.append((score, column))
@@ -330,6 +365,7 @@ def _resolve_dimensions(
     time_dimension: ColumnProfile | None,
     allow_identifiers: bool,
     value_validator: Callable[[ColumnProfile], bool] | None,
+    graph_hints: dict[str, Any],
 ) -> list[ColumnProfile]:
     candidates: list[tuple[float, ColumnProfile]] = []
     for table in catalog.values():
@@ -362,6 +398,7 @@ def _resolve_dimensions(
             direct_overlap = len(_raw_terms(column.name) & raw_query_terms)
             specificity = max(len(_raw_terms(column.name) - {"id", "name"}), 1)
             score = overlap * 6.0 + direct_overlap * 14.0 + (4.0 / specificity)
+            score += _graph_column_hint_score(column, graph_hints)
             if "name" in column.terms and column.terms & query_terms:
                 score += 4.0
             if "fact" in table.name or "joined" in table.name:
@@ -382,7 +419,12 @@ def _resolve_dimensions(
     return selected
 
 
-def _select_base_table(catalog: dict[str, TableProfile], required: list[ColumnProfile]) -> str:
+def _select_base_table(
+    catalog: dict[str, TableProfile],
+    required: list[ColumnProfile],
+    *,
+    graph_hints: dict[str, Any],
+) -> str:
     required_names = {column.name for column in required}
     scores: list[tuple[float, str]] = []
     for table in catalog.values():
@@ -392,9 +434,45 @@ def _select_base_table(catalog: dict[str, TableProfile], required: list[ColumnPr
             score += 5.0
         if "fact" in table.name or "joined" in table.name:
             score += 3.0
+        score += _graph_table_hint_score(table.name, graph_hints)
         scores.append((score, table.name))
     scores.sort(key=lambda item: (-item[0], item[1]))
     return scores[0][1]
+
+
+def _graph_table_hint_score(table: str, graph_hints: dict[str, Any]) -> float:
+    preferred = {str(value).lower() for value in graph_hints.get("tables") or [] if value}
+    if table.lower() in preferred:
+        return 18.0
+    table_terms = _terms(table)
+    return min(
+        8.0,
+        max(
+            (
+                float(_semantic_overlap(table_terms, _terms(value)) * 4)
+                for value in preferred
+            ),
+            default=0.0,
+        ),
+    )
+
+
+def _graph_column_hint_score(column: ColumnProfile, graph_hints: dict[str, Any]) -> float:
+    preferred_fields = {str(value).lower() for value in graph_hints.get("fields") or [] if value}
+    exact = column.name.lower() in preferred_fields
+    score = 14.0 if exact else 0.0
+    if not exact:
+        score += min(
+            6.0,
+            max(
+                (
+                    float(_semantic_overlap(column.terms, _terms(value)) * 3)
+                    for value in preferred_fields
+                ),
+                default=0.0,
+            ),
+        )
+    return score + _graph_table_hint_score(column.table, graph_hints)
 
 
 def _resolve_join_tree(

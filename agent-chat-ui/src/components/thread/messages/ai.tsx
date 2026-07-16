@@ -266,11 +266,6 @@ export function AssistantMessage({
     () => threadMessagesOverride ?? thread.messages ?? [],
     [threadMessagesOverride, thread.messages],
   );
-  const isLastMessage =
-    threadMessages[threadMessages.length - 1]?.id === message?.id;
-  const hasNoAIOrToolMessages = !threadMessages.find(
-    (m) => m.type === "ai" || m.type === "tool",
-  );
   const meta = message ? thread.getMessagesMetadata(message) : undefined;
 
   const anthropicStreamedToolCalls = Array.isArray(content)
@@ -481,7 +476,12 @@ export function AssistantMessage({
   }
 
   return (
-    <div className="group mr-auto flex w-full items-start gap-2">
+    <div
+      className={cn(
+        "group mx-auto flex w-full items-start gap-2",
+        graphDashboardWidget ? "max-w-none" : "max-w-3xl",
+      )}
+    >
       <div className="flex w-full flex-col gap-2">
         {isToolResult ? (
           <>
@@ -603,7 +603,7 @@ export function AssistantMessage({
 
 export function AssistantMessageLoading() {
   return (
-    <div className="mr-auto flex items-start gap-2">
+    <div className="mx-auto flex w-full max-w-3xl items-start gap-2">
       <div className="bg-muted flex h-8 items-center gap-1 rounded-2xl px-4 py-2">
         <div className="bg-foreground/50 h-1.5 w-1.5 animate-[pulse_1.5s_ease-in-out_infinite] rounded-full"></div>
         <div className="bg-foreground/50 h-1.5 w-1.5 animate-[pulse_1.5s_ease-in-out_0.5s_infinite] rounded-full"></div>
@@ -619,7 +619,7 @@ export function AssistantMessageError({
   error: string;
 }) {
   return (
-    <div className="mr-auto flex w-full items-start gap-2">
+    <div className="mx-auto flex w-full max-w-3xl items-start gap-2">
       <div className="flex w-full flex-col gap-2">
         <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900">
           <div className="font-medium">The run ended before the assistant could return a final response.</div>

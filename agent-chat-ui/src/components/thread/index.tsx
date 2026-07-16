@@ -4,8 +4,6 @@ import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { useStreamContext } from "@/providers/Stream";
 import { Button } from "../ui/button";
-import { Label } from "../ui/label";
-import { Switch } from "../ui/switch";
 import type {
   Message,
   Thread as LangGraphThread,
@@ -17,7 +15,6 @@ import { TooltipIconButton } from "./tooltip-icon-button";
 import {
   ArrowDown,
   LoaderCircle,
-  Paperclip,
   PanelRightOpen,
   PanelRightClose,
   SquarePen,
@@ -28,12 +25,6 @@ import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import ThreadHistory from "./history";
 import { toast } from "sonner";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
-import {
-  SUPPORTED_FILE_EXTENSIONS,
-  useFileUpload,
-} from "@/hooks/use-file-upload";
-import { describeContentBlockForModel } from "@/lib/multimodal-utils";
-import { ContentBlocksPreview } from "./ContentBlocksPreview";
 import {
   useArtifactOpen,
   ArtifactContent,
@@ -106,29 +97,13 @@ export function Thread() {
     "chatHistoryOpen",
     parseAsBoolean.withDefault(false),
   );
-  const [hideToolCalls, setHideToolCalls] = useQueryState(
-    "hideToolCalls",
-    parseAsBoolean.withDefault(false),
-  );
   const [input, setInput] = useState("");
-  const [manualSqlMode, setManualSqlMode] = useState(false);
   const [userId, setUserId] = useState("");
   const userIdRef = useRef("");
-  const {
-    contentBlocks,
-    setContentBlocks,
-    dropRef,
-    handleFileUpload,
-    removeBlock,
-    resetBlocks: _resetBlocks,
-    dragOver,
-    handlePaste,
-  } = useFileUpload();
   const isLargeScreen = useMediaQuery("(min-width: 1024px)");
   const { setThreads } = useThreads();
 
   const stream = useStreamContext();
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const messages = useMemo(() => {
     const raw = stream.messages ?? [];
@@ -267,7 +242,7 @@ export function Thread() {
     return null;
   };
 
-  const setThreadId = (id: string | null) => {
+  const setThreadId = useCallback((id: string | null) => {
     _setThreadId(id);
     if (!id) {
       clearGuestThreadId();
@@ -276,7 +251,7 @@ export function Thread() {
     // close artifact and reset artifact context
     closeArtifact();
     setArtifactContext({});
-  };
+  }, [_setThreadId, closeArtifact, setArtifactContext]);
 
   useEffect(() => {
     if (!stream.error) {
@@ -310,7 +285,7 @@ export function Thread() {
     } catch {
       // no-op
     }
-  }, [stream.error]);
+  }, [setThreadId, stream.error]);
 
   useEffect(() => {
     void resolveUserId();
@@ -318,28 +293,9 @@ export function Thread() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if ((input.trim().length === 0 && contentBlocks.length === 0) || isLoading)
-      return;
+    if (input.trim().length === 0 || isLoading) return;
 
     const trimmedInput = input.trim();
-    if (manualSqlMode) {
-      if (contentBlocks.length > 0) {
-        toast.error("Attachments are not supported in manual SQL mode.", {
-          duration: 3000,
-        });
-        return;
-      }
-      const normalizedSql = trimmedInput.toLowerCase();
-      if (
-        trimmedInput.length > 0 &&
-        !/^(select|with)\b/.test(normalizedSql)
-      ) {
-        toast.error("Manual SQL mode only supports read-only SELECT or WITH queries.", {
-          duration: 3500,
-        });
-        return;
-      }
-    }
 
     const resolvedUserId = await resolveUserId();
     const interrupt = stream.interrupt;
@@ -355,12 +311,6 @@ export function Thread() {
       approvalDecision &&
       firstInterruptValue?.action_requests?.[0]?.name === "web_search";
     if (isWebApproval) {
-      if (contentBlocks.length > 0) {
-        toast.error("Attachments are not supported for approvals.", {
-          duration: 3000,
-        });
-        return;
-      }
       stream.submit(
         {},
         {
@@ -377,69 +327,18 @@ export function Thread() {
         },
       );
       setInput("");
-      setContentBlocks([]);
       return;
     }
 
-    const attachedFileContext = (
-      await Promise.all(contentBlocks.map(describeContentBlockForModel))
-    )
-      .filter(Boolean)
-      .join("\n\n");
-    const submittedInput = trimmedInput;
-    const inputWithAttachments = [
-      submittedInput,
-      attachedFileContext
-        ? `The uploaded file has already been processed by the application. Do not use tools. Do not say you cannot access it.\nExact extracted uploaded file text:\n<<<FILE_TEXT>>>\n${attachedFileContext}\n<<<END_FILE_TEXT>>>\nWhen the user asks for text in the uploaded file, return only the text between FILE_TEXT markers.`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
     const newHumanMessage: Message = {
       id: uuidv4(),
       type: "human",
-      content: [
-        ...(inputWithAttachments.length > 0
-          ? [{ type: "text", text: inputWithAttachments }]
-          : []),
-        ...contentBlocks,
-      ] as Message["content"],
+      content: [{ type: "text", text: trimmedInput }] as Message["content"],
     };
-
-    const attachedFiles = contentBlocks.map((block, index) => {
-      const metadata = block.metadata ?? {};
-      const name =
-        typeof metadata.filename === "string"
-          ? metadata.filename
-          : typeof metadata.name === "string"
-            ? metadata.name
-            : `attachment-${index + 1}`;
-
-      return {
-        index,
-        name,
-        type: block.type,
-        mimeType: block.mimeType,
-      };
-    });
 
     const context = {
       ...(Object.keys(artifactContext).length > 0 ? artifactContext : {}),
-      ...(attachedFiles.length > 0
-        ? {
-            attached_files: attachedFiles,
-            attached_file_summary: attachedFiles.map(
-              ({ index, name, mimeType }) => ({
-                index,
-                name,
-                mimeType,
-              }),
-            ),
-            attached_file_context: attachedFileContext,
-          }
-        : {}),
       web_search_enabled: false,
-      manual_sql_enabled: manualSqlMode,
     };
 
     const guestId = ensureGuestId();
@@ -454,7 +353,6 @@ export function Thread() {
       ...threadMetadata,
       web_search_enabled: false,
       user_id: resolvedUserId,
-      manual_sql_enabled: manualSqlMode,
     };
 
     if (needsThreadId && newThreadId) {
@@ -501,7 +399,6 @@ export function Thread() {
     );
 
     setInput("");
-    setContentBlocks([]);
   };
 
   const handleRegenerate = (humanPrompt: string) => {
@@ -520,7 +417,6 @@ export function Thread() {
     };
     const context = {
       web_search_enabled: false,
-      manual_sql_enabled: false,
     };
     stream.submit(
       { messages: [newHumanMessage], context },
@@ -537,7 +433,6 @@ export function Thread() {
           guest_id: ensureGuestId(),
           web_search_enabled: false,
           user_id: resolvedUserId,
-          manual_sql_enabled: false,
         },
         optimisticValues: (prev) => ({
           ...prev,
@@ -741,7 +636,7 @@ export function Thread() {
                 !chatStarted && "mt-[25vh] flex flex-col items-stretch",
                 chatStarted && "grid grid-rows-[1fr_auto]",
               )}
-              contentClassName="pt-8 pb-16 max-w-3xl mx-auto flex flex-col gap-4 w-full"
+              contentClassName="pt-8 pb-16 mx-auto flex w-full max-w-[1600px] flex-col gap-4"
               content={
                 <>
                   {displayMessages
@@ -787,29 +682,16 @@ export function Thread() {
 
                   <ScrollToBottom className="animate-in fade-in-0 zoom-in-95 absolute bottom-full left-1/2 mb-4 -translate-x-1/2" />
 
-                  <div
-                    ref={dropRef}
-                    className={cn(
-                      "bg-muted relative z-10 mx-auto mb-8 w-full max-w-3xl rounded-2xl shadow-xs transition-all",
-                      dragOver
-                        ? "border-primary border-2 border-dotted"
-                        : "border border-solid",
-                    )}
-                  >
+                  <div className="bg-muted relative z-10 mx-auto mb-8 w-full max-w-3xl rounded-2xl border border-solid shadow-xs">
                     <form
                       onSubmit={handleSubmit}
                       className="mx-auto grid max-w-3xl grid-rows-[1fr_auto] gap-2"
                     >
-                      <ContentBlocksPreview
-                        blocks={contentBlocks}
-                        onRemove={removeBlock}
-                      />
                       <textarea
                         ref={textareaRef}
                         rows={4}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
-                        onPaste={handlePaste}
                         onKeyDown={(e) => {
                           if (
                             e.key === "Enter" &&
@@ -823,56 +705,11 @@ export function Thread() {
                             form?.requestSubmit();
                           }
                         }}
-                        placeholder={
-                          manualSqlMode
-                            ? "SELECT ... or WITH ..."
-                            : "Type your message..."
-                        }
-                        className={cn(
-                          "composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none",
-                          manualSqlMode && "font-mono text-sm",
-                        )}
+                        placeholder="Type your message..."
+                        className="composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none"
                       />
 
                       <div className="flex items-center gap-3 p-2 pt-4">
-                        <input
-                          ref={fileInputRef}
-                          type="file"
-                          multiple
-                          accept={SUPPORTED_FILE_EXTENSIONS}
-                          className="hidden"
-                          onChange={handleFileUpload}
-                        />
-                        <TooltipIconButton
-                          type="button"
-                          tooltip={
-                            manualSqlMode
-                              ? "Attachments are disabled in manual SQL mode"
-                              : "Add file"
-                          }
-                          variant="ghost"
-                          className="shrink-0 hover:bg-gray-200 dark:hover:bg-zinc-700"
-                          onClick={() => fileInputRef.current?.click()}
-                          disabled={manualSqlMode}
-                        >
-                          <Paperclip className="h-4 w-4" />
-                        </TooltipIconButton>
-                        <Label
-                          htmlFor="manual-sql-mode"
-                          className="text-muted-foreground ml-1 flex items-center gap-2 text-xs"
-                        >
-                          <Switch
-                            id="manual-sql-mode"
-                            checked={manualSqlMode}
-                            onCheckedChange={setManualSqlMode}
-                          />
-                          Manual SQL
-                        </Label>
-                        {manualSqlMode && (
-                          <span className="text-muted-foreground text-xs">
-                            Read-only `SELECT` or `WITH` only
-                          </span>
-                        )}
                         {stream.isLoading ? (
                           <Button
                             key="stop"
@@ -888,7 +725,7 @@ export function Thread() {
                             className="ml-auto shadow-md transition-all"
                             disabled={
                               isLoading ||
-                              (!input.trim() && contentBlocks.length === 0)
+                              !input.trim()
                             }
                           >
                             Send

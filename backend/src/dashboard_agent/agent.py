@@ -14,6 +14,12 @@ from langgraph.graph.message import add_messages
 from dashboard_agent.config import Settings
 from dashboard_agent.dashboard_planner import build_complex_dashboard
 from dashboard_agent.dashboard_widget import dataset_summaries, graph_dashboard_marker
+from dashboard_agent.graph_dashboard_cache import (
+    read_graph_dashboard_cache,
+    read_question_translation,
+    write_graph_dashboard_cache,
+    write_question_translation,
+)
 
 
 class AgentState(TypedDict, total=False):
@@ -26,6 +32,7 @@ settings: Settings | None = None
 _settings: Settings | None = None
 _store: Any | None = None
 _duckdb_field_cache: dict[str, dict[str, str]] = {}
+_question_language_cache: dict[str, str] = {}
 SAMPLE_FIELD_RE = re.compile(r"^\$\.sample_records\[(\d+)\]\.(.+)$")
 HUMAN_LABEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 HUMAN_KEEP_ALL_CAPS = {"API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"}
@@ -1978,7 +1985,11 @@ def _ranked_dimension_activity_from_payload(
     }
 
 
-def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any]:
+def _duckdb_ranked_dimension_context(
+    store: Any,
+    question: str,
+    graph_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     lowered = question.lower()
     wants_time = "time" in lowered or "trend" in lowered or "over time" in lowered or "overtime" in lowered
     if wants_time:
@@ -1999,7 +2010,7 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
     except Exception:
         return {}
     try:
-        plan = _ranked_dimension_plan(con, question)
+        plan = _ranked_dimension_plan(con, question, graph_hints=graph_hints)
         if not plan:
             return {}
         table = str(plan["table"])
@@ -2192,7 +2203,12 @@ def _duckdb_ranked_dimension_context(store: Any, question: str) -> dict[str, Any
         con.close()
 
 
-def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
+def _ranked_dimension_plan(
+    con: Any,
+    question: str,
+    *,
+    graph_hints: dict[str, Any] | None = None,
+) -> dict[str, str]:
     tables = [
         str(row[0])
         for row in con.execute(
@@ -2242,7 +2258,17 @@ def _ranked_dimension_plan(con: Any, question: str) -> dict[str, str]:
                 )
                 if "name" in intent_terms and "name" in _field_terms(dimension):
                     dimension_score += 2.0
-                candidates.append((dimension_score + measure_score + table_score, table, dimension, measure))
+                candidates.append(
+                    (
+                        dimension_score
+                        + measure_score
+                        + table_score
+                        + _graph_hint_score(graph_hints, table, dimension, measure),
+                        table,
+                        dimension,
+                        measure,
+                    )
+                )
     candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
     for _, table, dimension, measure in candidates:
         if _ranked_dimension_has_values(con, table, dimension, measure):
@@ -2617,7 +2643,12 @@ def _is_time_column(column: str, column_type: str, question: str) -> bool:
     return _time_column_score(column, question) > 0
 
 
-def _grouped_time_series_plan(con: Any, question: str) -> dict[str, str]:
+def _grouped_time_series_plan(
+    con: Any,
+    question: str,
+    *,
+    graph_hints: dict[str, Any] | None = None,
+) -> dict[str, str]:
     tables = [
         str(row[0])
         for row in con.execute(
@@ -2666,7 +2697,19 @@ def _grouped_time_series_plan(con: Any, question: str) -> dict[str, str]:
                     if not _grouped_time_series_has_values(con, table, time_column, dimension, measure):
                         continue
                     table_score = 4.0 if "fact" in table or "joined" in table else 0.0
-                    candidates.append((dimension_score + time_score + measure_score + table_score, table, time_column, dimension, measure))
+                    candidates.append(
+                        (
+                            dimension_score
+                            + time_score
+                            + measure_score
+                            + table_score
+                            + _graph_hint_score(graph_hints, table, time_column, dimension, measure),
+                            table,
+                            time_column,
+                            dimension,
+                            measure,
+                        )
+                    )
     candidates.sort(key=lambda item: (-item[0], item[1], item[2], item[3], item[4]))
     return {"table": candidates[0][1], "time": candidates[0][2], "dimension": candidates[0][3], "measure": candidates[0][4]} if candidates else {}
 
@@ -2715,7 +2758,11 @@ def _dimension_value_matches_request(value: Any, requested_values: set[str]) -> 
     return False
 
 
-def _duckdb_grouped_time_series_context(store: Any, question: str) -> dict[str, Any]:
+def _duckdb_grouped_time_series_context(
+    store: Any,
+    question: str,
+    graph_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     lowered = question.lower()
     wants_time = "time" in lowered or "trend" in lowered or "over time" in lowered or "overtime" in lowered
     wants_group = any(term in lowered for term in (" by ", "group", "split", "breakdown", "compare"))
@@ -2733,7 +2780,7 @@ def _duckdb_grouped_time_series_context(store: Any, question: str) -> dict[str, 
     except Exception:
         return {}
     try:
-        plan = _grouped_time_series_plan(con, question)
+        plan = _grouped_time_series_plan(con, question, graph_hints=graph_hints)
         if not plan:
             return {}
         table = plan["table"]
@@ -4293,6 +4340,101 @@ def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> di
     return activity
 
 
+def _agent_dashboard_reasoning(question: str, activity: dict[str, Any]) -> dict[str, Any]:
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    execution_source = str(summary.get("executionSource") or "").lower()
+    if not execution_source:
+        dataset_types = [
+            str(metadata.get("object_type") or "").lower()
+            for metadata in (activity.get("datasets") or {}).values()
+            if isinstance(metadata, dict)
+        ]
+        execution_source = "graph" if any("graph" in value for value in dataset_types) else "duckdb"
+        summary["executionSource"] = execution_source
+    if (
+        summary.get("reasoningSource") == "agent"
+        and summary.get("reasoningExecutionSource") == execution_source
+        and isinstance(activity.get("decisionTrace"), list)
+        and activity["decisionTrace"]
+    ):
+        return activity
+
+    slots = activity.get("chartSlots") if isinstance(activity.get("chartSlots"), list) else []
+    datasets = activity.get("datasets") if isinstance(activity.get("datasets"), dict) else {}
+    payload = {
+        "request": question,
+        "executionSource": execution_source,
+        "planningSource": summary.get("planningSource"),
+        "calculationSource": summary.get("calculationSource"),
+        "graphPlanning": summary.get("graphPlanning"),
+        "graphCacheMatchedQuestion": summary.get("graphCacheMatchedQuestion"),
+        "analyticalPlan": summary.get("analyticalPlan"),
+        "rowsUsed": summary.get("totalRecords") or summary.get("sampleRecords"),
+        "datasets": [
+            {
+                "name": name,
+                "objectType": metadata.get("object_type"),
+                "sourcePaths": metadata.get("source_paths") or metadata.get("sourcePaths") or [],
+            }
+            for name, metadata in datasets.items()
+            if isinstance(metadata, dict)
+        ],
+        "charts": [
+            {
+                "id": slot.get("id"),
+                "chartType": slot.get("chartType"),
+                "field": slot.get("field"),
+                "splitField": slot.get("splitField"),
+                "rows": len(slot.get("data") or []),
+            }
+            for slot in slots
+            if isinstance(slot, dict)
+        ],
+    }
+    parsed = _invoke_agent_json(
+        system=(
+            "Generate a concise dashboard decision summary from the supplied verified execution metadata. "
+            "Return only JSON with a reasoning array of 3 to 5 objects containing stage, detail, and evidence. "
+            "Explain request interpretation, current execution source, selected data and lineage, and chart binding. "
+            "When executionSource is hybrid, explicitly state that graph traversal selected candidate datasets, fields, lineage, "
+            "and relationships, then DuckDB validated joins and executed filters and aggregations. "
+            "Never claim DuckDB was queried when executionSource is graph; in that case describe DuckDB only as original lineage or materialization provenance. "
+            "Do not invent fields, filters, joins, counts, sources, or private chain-of-thought. Evidence must be short facts copied from the payload."
+        ),
+        payload=payload,
+    )
+    reasoning = parsed.get("reasoning") if isinstance(parsed, dict) else None
+    validated: list[dict[str, Any]] = []
+    if isinstance(reasoning, list):
+        for item in reasoning[:5]:
+            if not isinstance(item, dict):
+                continue
+            stage = str(item.get("stage") or "").strip()
+            detail = str(item.get("detail") or "").strip()
+            evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+            if not stage or not detail:
+                continue
+            if execution_source == "graph" and re.search(r"(?:queried|selected|loaded).{0,40}duckdb", detail, re.I):
+                continue
+            validated.append(
+                {
+                    "stage": stage[:80],
+                    "detail": detail[:500],
+                    "evidence": [str(value)[:240] for value in evidence[:8]],
+                }
+            )
+    if validated:
+        activity["decisionTrace"] = validated
+        summary["reasoningSource"] = "agent"
+        summary["reasoningExecutionSource"] = execution_source
+        activity["summary"] = summary
+    return activity
+
+
+def _invoke_agent_json(*, system: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    return _invoke_language_json(system=system, payload=payload)
+
+
 def _sanitize_activity_layout_spec(
     spec: dict[str, Any] | None,
     available_slots: set[str],
@@ -4501,9 +4643,535 @@ def _llm_answer(question: str, results: list[dict[str, Any]]) -> str:
     return f"{fallback}\n\nLLM synthesis unavailable after trying configured models: {'; '.join(failures)}"
 
 
+THAI_TEXT_RE = re.compile(r"[\u0E00-\u0E7F]")
+THAI_SPLIT_INTENT_RE = re.compile(r"(?:แยก|แบ่ง|จำแนก|แจกแจง|จัดกลุ่ม)")
+THAI_ANALYTICS_FALLBACK = {
+    "แสดง": " show ",
+    "และ": " and ",
+    "กับ": " with ",
+    "ชื่อ": " name ",
+    "แต่ละ": " each ",
+    "ตาม": " by ",
+    "ระหว่าง": " between ",
+    "อันดับ": " ranking ",
+    "ค่าเฉลี่ย": " average ",
+    "เปอร์เซ็นต์": " percentage ",
+    "สัดส่วน": " composition ",
+    "การกระจาย": " distribution ",
+    "เปรียบเทียบ": " compare ",
+    "แนวโน้ม": " trend ",
+    "แยกตาม": " by ",
+    "มากที่สุด": " most ",
+    "เรียนจบ": " completed ",
+    "กำลังเรียน": " in progress ",
+    "สถานะการเรียน": " learning status ",
+    "สถานศึกษา": " institute ",
+    "สถาบัน": " institute ",
+    "โรงเรียน": " school ",
+    "จังหวัด": " province ",
+    "หลักสูตร": " course ",
+    "ผู้ใช้งาน": " users ",
+    "ผู้ใช้": " users ",
+    "นักเรียน": " learners ",
+    "รายเดือน": " monthly ",
+    "รายวัน": " daily ",
+    "รายสัปดาห์": " weekly ",
+    "รายปี": " yearly ",
+    "ช่วงเวลา": " time range ",
+    "เวลา": " time ",
+    "จำนวน": " number ",
+}
+THAI_PRESENTATION_FALLBACK = {
+    "Activity dashboard": "แดชบอร์ดกิจกรรม",
+    "Dashboard generated from a validated multi-source analytical plan.": "แดชบอร์ดที่สร้างจากแผนวิเคราะห์ข้อมูลที่ผ่านการตรวจสอบ",
+    "Users": "ผู้ใช้งาน",
+    "Courses": "หลักสูตร",
+    "Province": "จังหวัด",
+    "School": "สถานศึกษา",
+    "Institute": "สถาบัน",
+    "Learning Status": "สถานะการเรียน",
+    "over time": "ตามช่วงเวลา",
+    " by ": " แยกตาม ",
+    "Distinct": "ไม่ซ้ำ",
+    "Total": "ทั้งหมด",
+    "Course and State Distribution Overview": "ภาพรวมการกระจายหลักสูตรและสถานะ",
+    "Activity rows": "จำนวนรายการกิจกรรม",
+    "Full aggregate": "ข้อมูลรวมทั้งหมด",
+    "Distinct user values": "จำนวนผู้ใช้งานไม่ซ้ำ",
+    "Course ID": "รหัสหลักสูตร",
+    "Student ID": "รหัสนักเรียน",
+    "Module Type": "ประเภทโมดูล",
+    "State": "สถานะ",
+    "Distribution": "การกระจาย",
+    "Overview": "ภาพรวม",
+    "Counts": "จำนวน",
+    "Count": "จำนวน",
+    "Course": "หลักสูตร",
+    "Student": "นักเรียน",
+    "Module": "โมดูล",
+    "Type": "ประเภท",
+    "Status": "สถานะ",
+    "Focus": "เน้น",
+    "Passed": "ผ่าน",
+    "In Progress": "กำลังเรียน",
+    "Inactive": "ไม่ได้ใช้งาน",
+    "Leading": "อันดับสูงสุด",
+    "Matched": "ที่ตรงกัน",
+    "Name": "ชื่อ",
+    "Split": "แบ่งตาม",
+    "User": "ผู้ใช้งาน",
+    "Value": "ค่า",
+    "leads this comparison.": "มีค่าสูงสุดในการเปรียบเทียบนี้",
+    "leads this comparison": "มีค่าสูงสุดในการเปรียบเทียบนี้",
+    "Distinct values included in the aggregate": "จำนวนค่าที่ไม่ซ้ำในผลรวม",
+    "Distinct ranked dimension values": "จำนวนค่ามิติที่ไม่ซ้ำ",
+    "Top value": "ค่าสูงสุด",
+    "comparison": "การเปรียบเทียบ",
+    "split": "แบ่งตาม",
+    "and": "และ",
+    "of": "ของ",
+}
+
+THAI_REASONING_FALLBACK = {
+    "request_interpretation": (
+        "Request interpretation",
+        "ตีความ dimension, measure, filter และ split จากคำขอของผู้ใช้",
+    ),
+    "execution_source": (
+        "Execution source",
+        "เลือก data source ที่ตรงกับ analytical plan และใช้ graph เป็นแหล่งหลักเมื่อมีผลลัพธ์พร้อมใช้งาน",
+    ),
+    "data_lineage": (
+        "Data lineage",
+        "ตรวจสอบ data lineage จาก source metadata ที่บันทึกไว้ใน graph",
+    ),
+    "chart_binding": (
+        "Chart binding",
+        "จับคู่ dimension, measure และ series กับ chart type ที่เหมาะกับคำขอ",
+    ),
+}
+UNTRANSLATED_REASONING_RE = re.compile(
+    r"\b(?:identify|retrieve|retrieved|aggregated|mapped|categorized|grouped|selected|matched)\b",
+    re.IGNORECASE,
+)
+CANONICAL_ANALYTICS_PHRASES = {
+    "broken down by": "split by",
+    "breakdown by": "split by",
+    "grouped by": "split by",
+    "segmented by": "split by",
+    "separated by": "split by",
+    "divided by": "split by",
+    "classified by": "split by",
+    "categorized by": "split by",
+    "enrollment status": "learning status",
+    "study status": "learning status",
+    "student status": "learning status",
+    "institutions": "institutes",
+    "institution": "institute",
+    "students": "users",
+    "learners": "users",
+}
+
+
+def _contains_thai(text: str) -> bool:
+    return bool(THAI_TEXT_RE.search(text))
+
+
+def _canonicalize_question_for_processing(question: str, *, graph_path: Path | None = None) -> str:
+    if not _contains_thai(question):
+        return _normalize_canonical_analytics_question(question)
+    cached = _question_language_cache.get(question)
+    if cached:
+        return cached
+    if graph_path is not None:
+        persisted = read_question_translation(graph_path, question)
+        if persisted:
+            persisted = _normalize_canonical_analytics_question(persisted)
+            persisted = _preserve_source_analytics_intent(question, persisted)
+            _question_language_cache[question] = persisted
+            write_question_translation(graph_path, question, persisted)
+            return persisted
+    parsed = _invoke_language_json(
+        system=(
+            "Translate the user's Thai or Thai-English analytics request into one concise English analytics request. "
+            "Preserve every measure, dimension, filter value, comparison, time grain, ranking, split, and requested chart type. "
+            "Do not answer the request and do not invent fields. Return only JSON: {\"englishQuestion\":\"...\"}."
+        ),
+        payload={"question": question},
+    )
+    english = str(parsed.get("englishQuestion") or "").strip() if isinstance(parsed, dict) else ""
+    if not english or _contains_thai(english):
+        english = _fallback_english_question(question)
+    english = _normalize_canonical_analytics_question(english)
+    english = _preserve_source_analytics_intent(question, english)
+    _question_language_cache[question] = english
+    if graph_path is not None:
+        write_question_translation(graph_path, question, english)
+    if len(_question_language_cache) > 200:
+        _question_language_cache.pop(next(iter(_question_language_cache)))
+    return english
+
+
+def _normalize_canonical_analytics_question(question: str) -> str:
+    result = question.strip()
+    for source, target in sorted(CANONICAL_ANALYTICS_PHRASES.items(), key=lambda item: -len(item[0])):
+        result = re.sub(rf"\b{re.escape(source)}\b", target, result, flags=re.IGNORECASE)
+    result = re.sub(r"\bper\b", "by", result, flags=re.IGNORECASE)
+    result = re.sub(r"\bfor each\b", "by", result, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _preserve_source_analytics_intent(source_question: str, english_question: str) -> str:
+    result = english_question.strip()
+    if THAI_SPLIT_INTENT_RE.search(source_question) and "split by" not in result.lower():
+        connectors = list(re.finditer(r"\b(?:and|with)\b", result, flags=re.IGNORECASE))
+        if connectors:
+            connector = connectors[-1]
+            result = f"{result[:connector.start()]}split by{result[connector.end():]}"
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _localize_activity_to_thai(question: str, activity: dict[str, Any]) -> dict[str, Any]:
+    if not _contains_thai(question):
+        return activity
+    layout = activity.get("layoutSpec") if isinstance(activity.get("layoutSpec"), dict) else {}
+    slots = activity.get("chartSlots") if isinstance(activity.get("chartSlots"), list) else []
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    summary["presentationLanguage"] = "th"
+    trace = activity.get("decisionTrace") if isinstance(activity.get("decisionTrace"), list) else []
+    display_values = sorted(
+        {
+            str(value).strip()
+            for slot in slots
+            if isinstance(slot, dict)
+            for datum in (slot.get("data") or [])
+            if isinstance(datum, dict)
+            for value in (datum.get("label"), datum.get("series"))
+            if value not in (None, "") and len(str(value).strip()) <= 80
+        }
+    )
+    localization_context = {
+        "request": question,
+        "title": layout.get("title"),
+        "subtitle": layout.get("subtitle"),
+        "charts": [{"id": slot.get("id"), "title": slot.get("title")} for slot in slots if isinstance(slot, dict)],
+        "metricLabels": summary.get("metricLabels") or {},
+        "displayValues": display_values,
+        "reasoning": [
+            {
+                "index": index,
+                "stage": item.get("stage") or item.get("step"),
+                "detail": item.get("detail"),
+                "evidence": item.get("evidence") or [],
+            }
+            for index, item in enumerate(trace[:8])
+            if isinstance(item, dict)
+        ],
+    }
+    parsed = _invoke_language_json(
+        system=(
+            "Localize dashboard presentation text into natural Thai. The backend analytical plan is already complete. "
+            "Write the surrounding explanatory prose in Thai, but NEVER translate established technical terms. Preserve terms such as "
+            "Request interpretation, Execution source, Data lineage, Chart binding, graph traversal, database query, data source, "
+            "dimension, measure, filter, split, series, chart type, stacked bar chart, horizontal bar chart, Parquet, JSON, DuckDB, and LangGraph. "
+            "Translate display-category values when they are semantic labels (for example Passed or In Progress), but preserve ids, "
+            "field names, source paths, numbers, course codes, and proper names. This is a concise decision summary, not private chain-of-thought. "
+            "Return only JSON with title, subtitle, chartTitles keyed by chart id, metricLabels keyed by existing metric id, "
+            "valueLabels keyed by the exact existing display value, and reasoning items containing index, detail, and evidence. "
+            "Do not translate or return a replacement for each reasoning stage."
+        ),
+        payload=localization_context,
+    )
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("title"), str) and _contains_thai(parsed["title"]):
+            layout["title"] = parsed["title"].strip()[:120]
+        if isinstance(parsed.get("subtitle"), str) and _contains_thai(parsed["subtitle"]):
+            layout["subtitle"] = parsed["subtitle"].strip()[:220]
+        chart_titles = parsed.get("chartTitles") if isinstance(parsed.get("chartTitles"), dict) else {}
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            translated = chart_titles.get(str(slot.get("id")))
+            if isinstance(translated, str) and _contains_thai(translated):
+                slot["title"] = translated.strip()[:140]
+        metric_labels = parsed.get("metricLabels") if isinstance(parsed.get("metricLabels"), dict) else {}
+        if metric_labels:
+            existing = summary.get("metricLabels") if isinstance(summary.get("metricLabels"), dict) else {}
+            for metric_id in list(existing):
+                translated = metric_labels.get(metric_id)
+                if isinstance(translated, str) and _contains_thai(translated):
+                    existing[metric_id] = translated.strip()[:100]
+            summary["metricLabels"] = existing
+        value_labels = parsed.get("valueLabels") if isinstance(parsed.get("valueLabels"), dict) else {}
+        if value_labels:
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                for datum in slot.get("data") or []:
+                    if not isinstance(datum, dict):
+                        continue
+                    for key in ("label", "series"):
+                        original = datum.get(key)
+                        translated = value_labels.get(str(original))
+                        if isinstance(translated, str) and _contains_thai(translated):
+                            datum[key] = translated.strip()[:100]
+        localized_trace = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), list) else []
+        for localized in localized_trace:
+            if not isinstance(localized, dict) or not isinstance(localized.get("index"), int):
+                continue
+            index = localized["index"]
+            if not 0 <= index < len(trace) or not isinstance(trace[index], dict):
+                continue
+            value = localized.get("detail")
+            if isinstance(value, str) and _contains_thai(value):
+                trace[index]["detail"] = value.strip()
+            if isinstance(localized.get("evidence"), list):
+                trace[index]["evidence"] = [str(item) for item in localized["evidence"][:8]]
+    _fallback_localize_activity(activity)
+    activity["layoutSpec"] = layout
+    activity["summary"] = summary
+    return activity
+
+
+def _invoke_language_json(*, system: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if get_settings().llm_mode == "never":
+        return None
+    candidates = _llm_candidates()
+    if not candidates:
+        return None
+    from langchain_openai import ChatOpenAI
+
+    for candidate in candidates:
+        try:
+            model = ChatOpenAI(
+                api_key=candidate["api_key"],
+                model=candidate["model"],
+                base_url=candidate.get("base_url"),
+                default_headers=candidate.get("headers") or None,
+                temperature=0,
+                timeout=12,
+                max_retries=0,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+            parsed = json.loads(
+                str(
+                    model.invoke(
+                        [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+                    ).content
+                )
+            )
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _fallback_english_question(question: str) -> str:
+    result = question
+    for thai, english in sorted(THAI_ANALYTICS_FALLBACK.items(), key=lambda item: -len(item[0])):
+        result = result.replace(thai, english)
+    result = THAI_TEXT_RE.sub(" ", result)
+    return re.sub(r"\s+", " ", result).strip() or question
+
+
+def _fallback_localize_activity(activity: dict[str, Any]) -> None:
+    def localize(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        result = value
+        for english, thai in sorted(THAI_PRESENTATION_FALLBACK.items(), key=lambda item: -len(item[0])):
+            pattern = re.escape(english)
+            if english[:1].isalnum():
+                pattern = rf"\b{pattern}"
+            if english[-1:].isalnum():
+                pattern = rf"{pattern}\b"
+            result = re.sub(pattern, thai, result, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", result).strip()
+
+    layout = activity.get("layoutSpec") if isinstance(activity.get("layoutSpec"), dict) else {}
+    for key in ("title", "subtitle"):
+        layout[key] = localize(layout.get(key))
+    if layout.get("title") and not _contains_thai(str(layout["title"])):
+        layout["title"] = "แดชบอร์ดข้อมูล"
+    if layout.get("subtitle") and not _contains_thai(str(layout["subtitle"])):
+        layout["subtitle"] = "สรุปข้อมูลตามคำขอ"
+    for slot in activity.get("chartSlots") or []:
+        if isinstance(slot, dict):
+            slot["title"] = localize(slot.get("title"))
+            if slot.get("title") and not _contains_thai(str(slot["title"])):
+                slot["title"] = "กราฟข้อมูล"
+            for datum in slot.get("data") or []:
+                if not isinstance(datum, dict):
+                    continue
+                for key in ("label", "series"):
+                    datum[key] = localize(datum.get(key))
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    labels = summary.get("metricLabels") if isinstance(summary.get("metricLabels"), dict) else {}
+    summary["metricLabels"] = {
+        key: translated if _contains_thai(str(translated)) else "ตัวชี้วัด"
+        for key, value in labels.items()
+        for translated in [localize(value)]
+    }
+    summary["presentationLanguage"] = "th"
+    trace = activity.get("decisionTrace") if isinstance(activity.get("decisionTrace"), list) else []
+    fallback_stage_keys = tuple(THAI_REASONING_FALLBACK)
+    for index, item in enumerate(trace):
+        if not isinstance(item, dict):
+            continue
+        original_stage = str(item.get("stage") or item.get("step") or "").strip()
+        stage_key = re.sub(r"[^a-z0-9]+", "_", original_stage.lower()).strip("_")
+        localized_stage = original_stage.replace("_", " ").strip().title()
+        localized_detail = item.get("detail")
+        fallback = THAI_REASONING_FALLBACK.get(stage_key)
+        if fallback is None and index < len(fallback_stage_keys):
+            fallback = THAI_REASONING_FALLBACK[fallback_stage_keys[index]]
+        if fallback:
+            localized_stage = fallback[0]
+            if (
+                not localized_detail
+                or not _contains_thai(str(localized_detail))
+                or UNTRANSLATED_REASONING_RE.search(str(localized_detail))
+            ):
+                localized_detail = fallback[1]
+        item["stage"] = localized_stage or "Decision summary"
+        item["detail"] = localized_detail or "ประมวลผลตาม analytical plan ที่ตรวจสอบแล้ว"
+
+
+def _graph_planning_hints(store: Any, results: list[dict[str, Any]]) -> dict[str, Any]:
+    tables: list[str] = []
+    fields: list[str] = []
+    source_paths: list[str] = []
+    evidence: list[str] = []
+    relationships: list[str] = []
+
+    def add(target: list[str], value: Any) -> None:
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return
+        text = str(value).strip()
+        if text and text not in target:
+            target.append(text)
+
+    for result in results[:24]:
+        if not isinstance(result, dict):
+            continue
+        add(evidence, result.get("label") or result.get("id"))
+        result_path = str(result.get("path") or "").strip()
+        result_source = str(result.get("source") or "").strip()
+        if result_path.startswith("$."):
+            path_field = re.split(r"[.\[\]]+", result_path)[-1]
+            add(fields, path_field or result.get("label") or result.get("text"))
+        else:
+            add(source_paths, result_path)
+        add(source_paths, result_source)
+        source_table_match = re.match(r"duckdb/([^/]+)/", result_source, flags=re.IGNORECASE)
+        if source_table_match:
+            add(tables, source_table_match.group(1))
+        raw_value = result.get("value")
+        if isinstance(raw_value, str):
+            try:
+                raw_value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                raw_value = None
+        if isinstance(raw_value, dict):
+            for key in ("duckdb_table", "table", "baseTable", "source_table"):
+                add(tables, raw_value.get(key))
+            for key in ("dimension_field", "measure_field", "time_field", "field", "column"):
+                add(fields, raw_value.get(key))
+            for key in ("source_path",):
+                add(source_paths, raw_value.get(key))
+            for key in ("source_paths", "sourcePaths"):
+                values = raw_value.get(key)
+                if isinstance(values, list):
+                    for value in values:
+                        add(source_paths, value)
+            sample_fields = raw_value.get("sample_fields")
+            if isinstance(sample_fields, list):
+                for field in sample_fields:
+                    if isinstance(field, dict):
+                        add(fields, field.get("name"))
+                    else:
+                        add(fields, field)
+        identifier = str(result.get("id") or "")
+        identifier_field_match = re.search(r"::\$\.(?:[^:]+\.)?([^.:\[\]]+)$", identifier)
+        if identifier_field_match:
+            add(fields, identifier_field_match.group(1))
+        aggregate_match = re.search(
+            r"ranked_dimension/([^/]+)/([^/]+)/by/([^/]+)",
+            identifier,
+            flags=re.IGNORECASE,
+        )
+        if aggregate_match:
+            add(tables, aggregate_match.group(1))
+            add(fields, aggregate_match.group(2))
+            add(fields, aggregate_match.group(3))
+        graph = getattr(store, "graph", None)
+        if graph is not None and identifier in graph:
+            for neighbor in list(graph.neighbors(identifier))[:8]:
+                attrs = graph.nodes[neighbor]
+                label = str(attrs.get("label") or attrs.get("name") or neighbor)
+                add(relationships, f"{result.get('label') or identifier} -> {label}")
+                node_type = str(attrs.get("type") or "").lower()
+                if node_type in {"field", "column"}:
+                    add(fields, attrs.get("name") or attrs.get("label") or neighbor)
+                if node_type in {"dataset", "table"}:
+                    add(tables, attrs.get("name") or attrs.get("label") or neighbor)
+
+    return {
+        "tables": tables[:12],
+        "fields": fields[:24],
+        "sourcePaths": _dedupe_source_paths(source_paths)[:16],
+        "evidence": evidence[:12],
+        "relationships": relationships[:16],
+    }
+
+
+def _graph_hint_score(graph_hints: dict[str, Any] | None, table: str, *fields: str) -> float:
+    hints = graph_hints or {}
+    preferred_tables = {str(value).lower() for value in hints.get("tables") or [] if value}
+    preferred_fields = {str(value).lower() for value in hints.get("fields") or [] if value}
+    score = 16.0 if table.lower() in preferred_tables else 0.0
+    for field in fields:
+        lowered = field.lower()
+        if lowered in preferred_fields:
+            score += 12.0
+            continue
+        field_terms = _field_terms(field)
+        score += min(
+            4.0,
+            max((float(len(field_terms & _field_terms(value)) * 2) for value in preferred_fields), default=0.0),
+        )
+    return score
+
+
+def _mark_hybrid_execution(activity: dict[str, Any], graph_hints: dict[str, Any]) -> dict[str, Any]:
+    if not activity:
+        return activity
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    summary.update(
+        {
+            "executionSource": "hybrid",
+            "planningSource": "graph",
+            "calculationSource": "duckdb",
+            "graphPlanning": {
+                "tables": list(graph_hints.get("tables") or [])[:12],
+                "fields": list(graph_hints.get("fields") or [])[:24],
+                "sourcePaths": list(graph_hints.get("sourcePaths") or [])[:16],
+                "relationships": list(graph_hints.get("relationships") or [])[:16],
+                "evidence": list(graph_hints.get("evidence") or [])[:12],
+            },
+        }
+    )
+    summary.pop("reasoningSource", None)
+    summary.pop("reasoningExecutionSource", None)
+    activity["summary"] = summary
+    return activity
+
+
 def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
-    question = _last_question(state)
+    user_question = _last_question(state)
     store = get_store()
+    question = _canonicalize_question_for_processing(user_question, graph_path=store.path)
     notices: list[str] = []
     wants_refresh = _wants_refresh(question)
     try:
@@ -4528,28 +5196,52 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
             notices.append(f"Using last saved graph because S3 refresh failed: {exc}")
 
     cache_results = _aggregate_cache_results(store, question)
-    results = cache_results + store.search(question, limit=24)
+    graph_results = store.search(question, limit=24)
+    results = cache_results + graph_results
     if _wants_dashboard(question):
         database_path = _duckdb_database_path(store)
-        activity = (
-            (build_complex_dashboard(database_path, question) if database_path else {})
-            or _duckdb_grouped_time_series_context(store, question)
-            or _graph_time_series_activity_context(store, question)
-            or _duckdb_ranked_dimension_context(store, question)
-            or _graph_ranked_dimension_context(store, question)
-            or _aggregate_cache_activity(store, question)
-            or _duckdb_activity_context(store, question)
-            or _activity_dashboard_context(store, results, question)
-        )
+        graph_hints = _graph_planning_hints(store, graph_results)
+        activity: dict[str, Any] = {}
+        generated = False
+        if database_path and database_path.exists():
+            activity = (
+                build_complex_dashboard(database_path, question, graph_hints=graph_hints)
+                or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
+                or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
+                or _duckdb_activity_context(store, question)
+            )
+            if activity:
+                activity = _mark_hybrid_execution(activity, graph_hints)
+                generated = True
+        if not activity:
+            activity = (
+                read_graph_dashboard_cache(store.path, question)
+                or _graph_time_series_activity_context(store, question)
+                or _graph_ranked_dimension_context(store, question)
+                or _aggregate_cache_activity(store, question)
+                or _activity_dashboard_context(store, results, question)
+            )
         if activity:
-            activity = _llm_design_complex_dashboard(question, activity)
-        title = "Activity dashboard" if activity else "Dashboard graph"
+            if generated:
+                activity = _llm_design_complex_dashboard(question, activity)
+            activity = _agent_dashboard_reasoning(question, activity)
+            write_graph_dashboard_cache(store.path, question, activity)
+            activity = _localize_activity_to_thai(user_question, activity)
+        title = "แดชบอร์ดข้อมูล" if _contains_thai(user_question) else ("Activity dashboard" if activity else "Dashboard graph")
         answer = graph_dashboard_marker(status=store.status(), results=results, activity=activity, title=title)
     else:
-        answer = _llm_answer(question, results)
+        answer = _llm_answer(user_question, results)
     if notices:
         answer = "\n\n".join(notices + [answer])
     return {"messages": [AIMessage(content=answer)]}
+
+
+def _is_complex_dashboard_request(question: str) -> bool:
+    lowered = f" {question.lower()} "
+    return any(
+        phrase in lowered
+        for phrase in (" and ", " compare ", " split by ", " grouped by ", " group by ", " breakdown by ", " for each ", " within ")
+    )
 
 
 builder = StateGraph(AgentState)

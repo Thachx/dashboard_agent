@@ -5,7 +5,6 @@ const nextConfig = {
       bodySizeLimit: "10mb",
     },
   },
-  serverExternalPackages: ["pdf-parse"],
   devIndicators: false
 };
 

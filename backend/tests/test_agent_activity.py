@@ -4,6 +4,12 @@ import pytest
 
 from dashboard_agent import agent
 from dashboard_agent.dashboard_planner import _catalog, plan_complex_dashboard
+from dashboard_agent.graph_dashboard_cache import (
+    read_graph_dashboard_cache,
+    read_question_translation,
+    write_graph_dashboard_cache,
+    write_question_translation,
+)
 
 
 class FakeStore:
@@ -207,6 +213,80 @@ def test_complex_planner_does_not_invent_unrequested_filters(tmp_path):
     assert {item["field"] for item in public_plan["dimensions"]} == {"course_id", "learning_status"}
 
 
+def test_complex_planner_uses_graph_hints_to_choose_duckdb_table():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    for table in ("dashboard_agent_alpha_fact", "dashboard_agent_beta_fact"):
+        con.execute(
+            f"""
+            create table {table} (
+                user_id integer,
+                province varchar,
+                learning_status varchar
+            )
+            """
+        )
+
+    plan = plan_complex_dashboard(
+        _catalog(con),
+        "compare users by province and learning status",
+        graph_hints={
+            "tables": ["dashboard_agent_beta_fact"],
+            "fields": ["user_id", "province", "learning_status"],
+            "sourcePaths": ["data/beta.json"],
+            "evidence": ["Beta enrollment dataset"],
+        },
+    )
+
+    assert plan is not None
+    assert plan.base_table == "dashboard_agent_beta_fact"
+    assert plan.measure.table == "dashboard_agent_beta_fact"
+    assert {dimension.table for dimension in plan.dimensions} == {"dashboard_agent_beta_fact"}
+    assert plan.public_dict()["graphHints"]["sourcePaths"] == ["data/beta.json"]
+
+
+def test_hybrid_execution_records_graph_planning_and_duckdb_calculation():
+    activity = {
+        "datasets": {"fact": {"object_type": "duckdb_join_plan"}},
+        "summary": {"totalRecords": 10},
+        "chartSlots": [{"id": "users", "data": [{"label": "A", "value": 10}]}],
+    }
+    hints = {
+        "tables": ["fact"],
+        "fields": ["user_id", "province"],
+        "sourcePaths": ["data/users.json"],
+        "relationships": ["Users -> Province"],
+        "evidence": ["User dataset"],
+    }
+
+    hybrid = agent._mark_hybrid_execution(activity, hints)
+
+    assert hybrid["summary"]["executionSource"] == "hybrid"
+    assert hybrid["summary"]["planningSource"] == "graph"
+    assert hybrid["summary"]["calculationSource"] == "duckdb"
+    assert hybrid["summary"]["graphPlanning"]["relationships"] == ["Users -> Province"]
+
+
+def test_graph_planning_hints_separate_json_field_paths_from_sources(tmp_path):
+    hints = agent._graph_planning_hints(
+        FakeStore(tmp_path / "graph.json"),
+        [
+            {
+                "id": "duckdb/unified_records/parquet/fact_student_course/part.parquet::$.sample_records[0].province",
+                "label": "Province",
+                "path": "$.sample_records[0].province",
+                "source": "duckdb/unified_records/parquet/fact_student_course/part.parquet",
+                "text": "province",
+            }
+        ],
+    )
+
+    assert "province" in hints["fields"]
+    assert "unified_records" in hints["tables"]
+    assert "$.sample_records[0].province" not in hints["sourcePaths"]
+    assert hints["sourcePaths"] == ["duckdb/unified_records/parquet/fact_student_course/part.parquet"]
+
+
 def test_chart_type_choices_only_accept_compatible_renderers():
     activity = {
         "chartSlots": [
@@ -235,3 +315,309 @@ def test_chart_type_choices_only_accept_compatible_renderers():
     assert activity["chartSlots"][0]["chartType"] == "radar"
     assert activity["chartSlots"][1]["chartType"] == "multi_line"
     assert agent._prompt_chart_type_choice("show the composition as a pie chart") == "pie"
+
+
+def test_duckdb_fallback_is_persisted_and_reused_as_graph_aggregate(tmp_path):
+    graph_path = tmp_path / "graph.json"
+    activity = {
+        "datasets": {
+            "fact": {
+                "source": "fact",
+                "object_type": "duckdb_join_plan",
+            }
+        },
+        "summary": {"totalDistinctMeasure": 42},
+        "decisionTrace": [
+            {
+                "stage": "Select data",
+                "detail": "Selected dashboard_agent_user_course_fact from duckdb context because it contains the ranked dimension and measure.",
+            },
+            {
+                "stage": "Collect lineage",
+                "detail": "Resolved dashboard sources from DuckDB lineage metadata, source path columns, or source_summary fallback.",
+            },
+        ],
+        "chartSlots": [{"id": "users", "chartType": "column", "data": [{"label": "A", "value": 42}]}],
+    }
+
+    assert write_graph_dashboard_cache(graph_path, "compare users by province and institute", activity)
+    cached = read_graph_dashboard_cache(graph_path, "compare user by institution and province")
+
+    assert cached["summary"]["executionSource"] == "graph"
+    assert cached["datasets"]["fact"]["object_type"] == "graph_dashboard_aggregate"
+    assert cached["chartSlots"] == activity["chartSlots"]
+    details = " ".join(str(item.get("detail") or "") for item in cached["decisionTrace"])
+    assert details == ""
+    assert "from duckdb context" not in details.lower()
+
+
+def test_thai_fallback_normalizes_processing_and_localizes_presentation(monkeypatch):
+    monkeypatch.setattr(agent, "_invoke_language_json", lambda **_kwargs: None)
+    question = "แสดงจำนวนผู้ใช้งานแยกตามจังหวัดมากที่สุด"
+
+    canonical = agent._canonicalize_question_for_processing(question)
+    activity = {
+        "layoutSpec": {"title": "Users by Province", "subtitle": "Activity dashboard"},
+        "summary": {"metricLabels": {"total": "Total Users"}},
+        "chartSlots": [{"id": "province", "title": "Users by Province", "data": []}],
+    }
+    localized = agent._localize_activity_to_thai(question, activity)
+
+    assert not agent._contains_thai(canonical)
+    assert "users" in canonical.lower()
+    assert agent._contains_thai(localized["layoutSpec"]["title"])
+    assert localized["summary"]["metricLabels"]["total"] == "ทั้งหมด ผู้ใช้งาน"
+
+
+def test_thai_fallback_preserves_complex_analytical_structure(monkeypatch):
+    monkeypatch.setattr(agent, "_invoke_language_json", lambda **_kwargs: None)
+
+    canonical = agent._canonicalize_question_for_processing(
+        "แสดงแนวโน้มจำนวนผู้ใช้งานรายเดือนแยกตามจังหวัดและสถานศึกษา"
+    )
+
+    assert "trend" in canonical
+    assert "monthly" in canonical
+    assert "users" in canonical
+    assert "province" in canonical
+    assert "split by" in canonical
+    assert "institute" in canonical
+
+
+def test_thai_localization_rejects_untranslated_model_output(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "_invoke_language_json",
+        lambda **_kwargs: {
+            "title": "Course and State Distribution Overview",
+            "subtitle": "Counts of courses and states",
+            "chartTitles": {"courses": "Course ID Distribution"},
+            "metricLabels": {"rows": "Activity rows"},
+        },
+    )
+    activity = {
+        "layoutSpec": {
+            "title": "Course and State Distribution Overview",
+            "subtitle": "Counts of courses and states",
+        },
+        "summary": {"metricLabels": {"rows": "Activity rows"}},
+        "chartSlots": [
+            {"id": "courses", "title": "Course ID Distribution", "data": []},
+        ],
+    }
+
+    localized = agent._localize_activity_to_thai("แสดงการกระจายหลักสูตร", activity)
+
+    assert agent._contains_thai(localized["layoutSpec"]["title"])
+    assert agent._contains_thai(localized["layoutSpec"]["subtitle"])
+    assert agent._contains_thai(localized["chartSlots"][0]["title"])
+    assert agent._contains_thai(localized["summary"]["metricLabels"]["rows"])
+
+
+def test_thai_localization_covers_mixed_labels_reasoning_and_category_values(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "_invoke_language_json",
+        lambda **_kwargs: {
+            "title": "ผู้ใช้งาน by Institute Name",
+            "subtitle": "ราชวินิตบางแก้ว leads this comparison.",
+            "chartTitles": {"institutes": "ผู้ใช้งาน by Institute Name split by Learning Status"},
+            "metricLabels": {
+                "topDimensionValue": "Leading ผู้ใช้งาน",
+                "totalDistinctMeasure": "Matched ผู้ใช้งาน",
+            },
+            "reasoning": [
+                {
+                    "index": 0,
+                    "stage": "request_interpretation",
+                    "detail": "Identify institute names and user counts categorized by learning status.",
+                    "evidence": [],
+                }
+            ],
+        },
+    )
+    activity = {
+        "layoutSpec": {
+            "title": "Users by Institute Name",
+            "subtitle": "ราชวินิตบางแก้ว leads this comparison.",
+        },
+        "summary": {
+            "metricLabels": {
+                "topDimensionValue": "Leading Users",
+                "totalDistinctMeasure": "Matched Users",
+            }
+        },
+        "chartSlots": [
+            {
+                "id": "institutes",
+                "title": "Users by Institute Name split by Learning Status",
+                "data": [
+                    {"label": "ราชวินิตบางแก้ว", "series": "Passed", "value": 10},
+                    {"label": "ราชวินิตบางแก้ว", "series": "In Progress", "value": 8},
+                    {"label": "ราชวินิตบางแก้ว", "series": "Inactive", "value": 2},
+                ],
+            }
+        ],
+        "decisionTrace": [
+            {
+                "stage": "request_interpretation",
+                "detail": "Identify institute names and user counts categorized by learning status.",
+            }
+        ],
+    }
+
+    localized = agent._localize_activity_to_thai("จำนวนผู้ใช้แยกตามสถาบันและสถานะการเรียน", activity)
+
+    assert localized["summary"]["presentationLanguage"] == "th"
+    assert "Institute" not in localized["layoutSpec"]["title"]
+    assert "leads this comparison" not in localized["layoutSpec"]["subtitle"]
+    assert "Learning Status" not in localized["chartSlots"][0]["title"]
+    assert [row["series"] for row in localized["chartSlots"][0]["data"]] == [
+        "ผ่าน",
+        "กำลังเรียน",
+        "ไม่ได้ใช้งาน",
+    ]
+    assert localized["decisionTrace"][0]["stage"] == "Request interpretation"
+    assert "Identify" not in localized["decisionTrace"][0]["detail"]
+    assert "dimension" in localized["decisionTrace"][0]["detail"]
+
+
+def test_thai_reasoning_preserves_technical_terms(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "_invoke_language_json",
+        lambda **_kwargs: {
+            "title": "ผู้ใช้งานตามสถาบัน",
+            "subtitle": "แสดงผลตามคำขอ",
+            "reasoning": [
+                {
+                    "index": 0,
+                    "detail": "ดึงข้อมูลด้วย graph traversal แทน direct database query",
+                    "evidence": [],
+                },
+                {
+                    "index": 1,
+                    "detail": "แสดงผลด้วย stacked bar chart และ horizontal bar chart",
+                    "evidence": [],
+                },
+            ],
+        },
+    )
+    activity = {
+        "layoutSpec": {"title": "Users by Institute", "subtitle": "Dashboard"},
+        "summary": {"metricLabels": {}},
+        "chartSlots": [],
+        "decisionTrace": [
+            {"stage": "execution_source", "detail": "Data retrieved from graph."},
+            {"stage": "chart_binding", "detail": "Mapped to charts."},
+        ],
+    }
+
+    localized = agent._localize_activity_to_thai("แสดงผู้ใช้ตามสถาบัน", activity)
+
+    assert localized["decisionTrace"][0] == {
+        "stage": "Execution source",
+        "detail": "ดึงข้อมูลด้วย graph traversal แทน direct database query",
+        "evidence": [],
+    }
+    assert localized["decisionTrace"][1] == {
+        "stage": "Chart binding",
+        "detail": "แสดงผลด้วย stacked bar chart และ horizontal bar chart",
+        "evidence": [],
+    }
+
+
+def test_thai_canonical_translation_persists_across_memory_cache(tmp_path, monkeypatch):
+    graph_path = tmp_path / "graph.json"
+    question = "แสดงจำนวนผู้ใช้แยกตามจังหวัด"
+    calls = 0
+
+    def translate(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"englishQuestion": "show users by province"}
+
+    monkeypatch.setattr(agent, "_invoke_language_json", translate)
+    agent._question_language_cache.clear()
+    first = agent._canonicalize_question_for_processing(question, graph_path=graph_path)
+    agent._question_language_cache.clear()
+    second = agent._canonicalize_question_for_processing(question, graph_path=graph_path)
+
+    assert first == second == "show users by province"
+    assert calls == 1
+    assert read_question_translation(graph_path, question) == first
+
+
+def test_question_translation_cache_round_trip(tmp_path):
+    graph_path = tmp_path / "graph.json"
+    assert write_question_translation(graph_path, "คำถาม", "question")
+    assert read_question_translation(graph_path, "คำถาม") == "question"
+
+
+def test_canonical_analytics_synonyms_preserve_split_semantics():
+    normalized = agent._normalize_canonical_analytics_question(
+        "Number of students per institution broken down by enrollment status for each institution"
+    )
+
+    assert "users by institute split by learning status" in normalized.lower()
+    assert "broken down" not in normalized.lower()
+    assert "enrollment status" not in normalized.lower()
+
+
+def test_thai_split_intent_repairs_weakened_translation(tmp_path):
+    graph_path = tmp_path / "graph.json"
+    question = "จำนวนผู้ใช้ในแต่ละสถาบันโดยแบ่งด้วยสถานะการเรียน"
+    write_question_translation(
+        graph_path,
+        question,
+        "Number of users by institute and learning status",
+    )
+    agent._question_language_cache.clear()
+
+    canonical = agent._canonicalize_question_for_processing(question, graph_path=graph_path)
+
+    assert canonical == "Number of users by institute split by learning status"
+    assert read_question_translation(graph_path, question) == canonical
+
+
+def test_agent_reasoning_uses_verified_graph_execution_context(monkeypatch):
+    captured = {}
+
+    def explain(*, system, payload):
+        captured.update(payload)
+        return {
+            "reasoning": [
+                {
+                    "stage": "Execute plan",
+                    "detail": "The persisted graph aggregate supplied the selected dimensions and measure.",
+                    "evidence": ["executionSource: graph"],
+                },
+                {
+                    "stage": "Bind chart",
+                    "detail": "School Name is the category and Learning Status is the split series.",
+                    "evidence": ["chartType: stacked_bar"],
+                },
+            ]
+        }
+
+    monkeypatch.setattr(agent, "_invoke_agent_json", explain)
+    activity = {
+        "datasets": {"fact": {"object_type": "graph_dashboard_aggregate", "source_paths": ["fact.parquet"]}},
+        "summary": {"executionSource": "graph", "totalRecords": 10},
+        "chartSlots": [
+            {
+                "id": "users",
+                "chartType": "stacked_bar",
+                "field": "school_name",
+                "splitField": "learning_status",
+                "data": [{"label": "A", "series": "passed", "value": 1}],
+            }
+        ],
+    }
+
+    result = agent._agent_dashboard_reasoning("users by school split by status", activity)
+
+    assert captured["executionSource"] == "graph"
+    assert result["summary"]["reasoningSource"] == "agent"
+    assert result["summary"]["reasoningExecutionSource"] == "graph"
+    assert len(result["decisionTrace"]) == 2

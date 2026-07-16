@@ -60,7 +60,8 @@ type SourceModalState = {
 } | null;
 
 type DecisionTraceItem = {
-  step: string;
+  step?: string;
+  stage?: string;
   detail: string;
   evidence?: string[];
 };
@@ -68,6 +69,18 @@ type DecisionTraceItem = {
 const CHART_COLORS = ["#2563eb", "#10b981", "#f97316", "#7c3aed", "#ec4899", "#64748b"];
 const HUMAN_LABEL_RE = /([a-z0-9])([A-Z])/g;
 const HUMAN_KEEP_ALL_CAPS = new Set(["API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"]);
+const THAI_SOURCE_LABELS: Record<string, string> = {
+  "Dashboard sources": "แหล่งข้อมูลแดชบอร์ด",
+  "Original source": "แหล่งข้อมูลต้นทาง",
+  "Derived table": "ตารางที่ประมวลผลแล้ว",
+  "Object type": "ชนิดข้อมูล",
+  "Rows used": "จำนวนแถวที่ใช้",
+  Coverage: "ขอบเขตข้อมูล",
+  Fields: "ฟิลด์ข้อมูล",
+  "Query plan": "แผนการสืบค้น",
+  Source: "แหล่งข้อมูล",
+  Updated: "อัปเดตล่าสุด",
+};
 
 type DatasetSummary = {
   key: string;
@@ -147,6 +160,8 @@ type ActivityDashboardPayload = {
     distinctUsers?: number;
     sourcePaths?: string[];
     sourceSamples?: Record<string, unknown[]>;
+    presentationLanguage?: string;
+    metricLabels?: Record<string, string>;
   };
   charts?: {
     events?: ChartDatum[];
@@ -278,9 +293,11 @@ function sampleTableColumns(rows: Record<string, unknown>[]): string[] {
 function SampleDataModal({
   state,
   onClose,
+  language = "en",
 }: {
   state: SourceModalState;
   onClose: () => void;
+  language?: string;
 }) {
   const [viewMode, setViewMode] = useState<"table" | "raw">("table");
   if (!state) return null;
@@ -292,14 +309,14 @@ function SampleDataModal({
       <div className="flex h-[90vh] max-h-[92vh] w-full max-w-[min(96vw,1280px)] flex-col overflow-hidden rounded-lg border bg-background shadow-xl">
         <div className="flex items-start justify-between gap-3 border-b px-4 py-3">
           <div className="min-w-0">
-            <p className="text-sm font-semibold">Sample data</p>
+            <p className="text-sm font-semibold">{language === "th" ? "ข้อมูลตัวอย่าง" : "Sample data"}</p>
             <p className="mt-1 break-words text-xs text-muted-foreground">{state.title}</p>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="rounded-md p-1 text-muted-foreground transition hover:bg-muted hover:text-foreground"
-            aria-label="Close sample data"
+            aria-label={language === "th" ? "ปิดข้อมูลตัวอย่าง" : "Close sample data"}
           >
             <X className="h-4 w-4" aria-hidden="true" />
           </button>
@@ -313,7 +330,7 @@ function SampleDataModal({
               viewMode === "table" ? "bg-foreground text-background" : "bg-background text-foreground/70 hover:text-foreground"
             } disabled:cursor-not-allowed disabled:opacity-40`}
           >
-            Table
+            {language === "th" ? "ตาราง" : "Table"}
           </button>
           <button
             type="button"
@@ -322,7 +339,7 @@ function SampleDataModal({
               viewMode === "raw" ? "bg-foreground text-background" : "bg-background text-foreground/70 hover:text-foreground"
             }`}
           >
-            Raw
+            {language === "th" ? "ข้อมูลดิบ" : "Raw"}
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-auto p-4">
@@ -363,7 +380,9 @@ function SampleDataModal({
               ))}
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">No sample data is available in this widget payload.</p>
+            <p className="text-sm text-muted-foreground">
+              {language === "th" ? "ไม่มีข้อมูลตัวอย่างสำหรับผลลัพธ์นี้" : "No sample data is available in this widget payload."}
+            </p>
           )}
         </div>
       </div>
@@ -372,11 +391,13 @@ function SampleDataModal({
 }
 
 function SourceDisclosure({
-  label = "Show source",
+  label,
   items,
+  language = "en",
 }: {
   label?: string;
   items: SourceDisclosureItem[];
+  language?: string;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [sampleModal, setSampleModal] = useState<SourceModalState>(null);
@@ -397,13 +418,15 @@ function SourceDisclosure({
           className={`h-3.5 w-3.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`}
           aria-hidden="true"
         />
-        <span className="truncate">{label}</span>
+        <span className="truncate">{label ?? (language === "th" ? "แสดงแหล่งข้อมูล" : "Show source")}</span>
       </button>
       {isOpen ? (
         <dl className="mt-2 grid gap-1 rounded-lg border bg-muted/10 p-3 text-xs">
           {visibleItems.map((item, index) => (
             <div key={`${item.label}-${index}`} className="grid gap-1 sm:grid-cols-[140px_1fr]">
-              <dt className="text-muted-foreground">{item.label}</dt>
+              <dt className="text-muted-foreground">
+                {language === "th" ? THAI_SOURCE_LABELS[item.label] ?? item.label : item.label}
+              </dt>
               <dd className="flex min-w-0 flex-wrap gap-1.5 font-medium text-foreground/80">
                 {item.value.map((value) => {
                   const samples = sampleRowsForSource(item.samples, value);
@@ -416,7 +439,7 @@ function SourceDisclosure({
                       type="button"
                       onClick={() => setSampleModal({ title: value, samples })}
                       className="max-w-full rounded border bg-background px-2 py-0.5 text-left text-foreground/70 transition hover:border-foreground/30 hover:text-foreground"
-                      title={`Show sample data for ${value}`}
+                      title={language === "th" ? `แสดงข้อมูลตัวอย่างของ ${value}` : `Show sample data for ${value}`}
                     >
                       <span className="block truncate">{sampleTitle(value)}</span>
                     </button>
@@ -427,7 +450,7 @@ function SourceDisclosure({
           ))}
         </dl>
       ) : null}
-      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} />
+      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} language={language} />
     </div>
   );
 }
@@ -435,13 +458,15 @@ function SourceDisclosure({
 function ReasoningDisclosure({
   trace,
   samples,
+  language = "en",
 }: {
   trace?: DecisionTraceItem[];
   samples?: unknown[];
+  language?: string;
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [sampleModal, setSampleModal] = useState<SourceModalState>(null);
-  const items = (trace ?? []).filter((item) => item.step || item.detail);
+  const items = (trace ?? []).filter((item) => item.stage || item.step || item.detail);
   if (!items.length) return null;
 
   return (
@@ -456,13 +481,13 @@ function ReasoningDisclosure({
           className={`h-3.5 w-3.5 shrink-0 transition-transform ${isOpen ? "rotate-180" : ""}`}
           aria-hidden="true"
         />
-        <span className="truncate">Show reasoning</span>
+        <span className="truncate">{language === "th" ? "แสดงสรุปการตัดสินใจ" : "Show reasoning"}</span>
       </button>
       {isOpen ? (
         <ol className="mt-2 grid gap-2 rounded-lg border bg-muted/10 p-3 text-xs">
           {items.map((item, index) => (
-            <li key={`${item.step}-${index}`} className="grid gap-1 sm:grid-cols-[140px_1fr]">
-              <span className="font-medium text-foreground/75">{item.step}</span>
+            <li key={`${item.stage ?? item.step ?? "reasoning"}-${index}`} className="grid gap-1 sm:grid-cols-[140px_1fr]">
+              <span className="font-medium text-foreground/75">{humanLabel(item.stage ?? item.step ?? "")}</span>
               <span className="min-w-0 text-foreground/80">
                 <span className="block break-words">{item.detail}</span>
                 {item.evidence?.length ? (
@@ -482,7 +507,7 @@ function ReasoningDisclosure({
                           type="button"
                           onClick={() => setSampleModal({ title: entry, samples: sourceSamples })}
                           className="max-w-full rounded border bg-background px-1.5 py-0.5 text-left text-foreground/70 transition hover:border-foreground/30 hover:text-foreground"
-                          title={`Show sample data for ${entry}`}
+                          title={language === "th" ? `แสดงข้อมูลตัวอย่างของ ${entry}` : `Show sample data for ${entry}`}
                         >
                           <span className="block truncate">{entry}</span>
                         </button>
@@ -495,7 +520,7 @@ function ReasoningDisclosure({
           ))}
         </ol>
       ) : null}
-      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} />
+      <SampleDataModal state={sampleModal} onClose={() => setSampleModal(null)} language={language} />
     </div>
   );
 }
@@ -1232,6 +1257,14 @@ function ChartSlotCard({
   return <BreakdownList data={slot.data} title={slot.title} kind={kind} />;
 }
 
+function chartUsesFullRow(slot: ChartSlot, requestedSpan?: number) {
+  if (requestedSpan !== 2) return false;
+  if (slot.data.some((item) => item.series)) return true;
+  return ["multi_line", "line", "area", "stacked_column", "stacked_bar"].includes(
+    slot.chartType,
+  );
+}
+
 function DashboardBarChart({
   data,
   dataKey,
@@ -1293,6 +1326,8 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     : Object.values(activity?.datasets ?? {});
   const sourceMeta = datasetValues[0];
   const summary = activity?.summary ?? {};
+  const language = summary.presentationLanguage === "th" ? "th" : "en";
+  const isThai = language === "th";
   const metricLabels =
     ((summary as Record<string, unknown>).metricLabels as Record<string, string> | undefined) ?? {};
   const metricDefs: Record<
@@ -1300,57 +1335,65 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     { label: string; value: number | string | undefined; hint: string; icon: typeof Activity }
   > = {
     totalRecords: {
-      label: "Activity rows",
+      label: metricLabels.totalRecords ?? (isThai ? "จำนวนรายการกิจกรรม" : "Activity rows"),
       value: summary.totalRecords ?? sourceMeta?.totalRecords ?? summary.sampleRecords ?? records.length,
-      hint: summary.isFullAggregate ? "Full aggregate" : "Matched sample",
+      hint: summary.isFullAggregate
+        ? (isThai ? "ข้อมูลรวมทั้งหมด" : "Full aggregate")
+        : (isThai ? "ตัวอย่างที่ตรงกัน" : "Matched sample"),
       icon: Activity,
     },
     sampleRecords: {
-      label: "Sample rows",
+      label: metricLabels.sampleRecords ?? (isThai ? "จำนวนแถวตัวอย่าง" : "Sample rows"),
       value: summary.sampleRecords ?? records.length,
-      hint: "Rows available in the widget",
+      hint: isThai ? "แถวข้อมูลที่แสดงในแดชบอร์ด" : "Rows available in the widget",
       icon: Database,
     },
     distinctEvents: {
-      label: "Event types",
+      label: metricLabels.distinctEvents ?? (isThai ? "ประเภทกิจกรรม" : "Event types"),
       value: summary.distinctEvents ?? charts.events?.length,
-      hint: "Distinct event values",
+      hint: isThai ? "จำนวนประเภทกิจกรรมที่ไม่ซ้ำ" : "Distinct event values",
       icon: BarChart3,
     },
     distinctCourses: {
-      label: "Courses",
+      label: metricLabels.distinctCourses ?? (isThai ? "หลักสูตร" : "Courses"),
       value: summary.distinctCourses ?? charts.courses?.length,
-      hint: "Distinct course values",
+      hint: isThai ? "จำนวนหลักสูตรที่ไม่ซ้ำ" : "Distinct course values",
       icon: BookOpen,
     },
     distinctUsers: {
-      label: "Users",
+      label: metricLabels.distinctUsers ?? (isThai ? "ผู้ใช้งาน" : "Users"),
       value: summary.distinctUsers,
-      hint: "Distinct user values",
+      hint: isThai ? "จำนวนผู้ใช้งานที่ไม่ซ้ำ" : "Distinct user values",
       icon: Users,
     },
     distinctDimensionValues: {
       label:
         metricLabels.distinctDimensionValues ??
-        `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
+        isThai
+          ? `จำนวน${formatValue((summary as Record<string, unknown>).topDimensionName, "มิติข้อมูล")}ที่ไม่ซ้ำ`
+          : `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
       value: (summary as Record<string, unknown>).distinctDimensionValues as number | string | undefined,
-      hint: "Distinct ranked dimension values",
+      hint: isThai ? "จำนวนค่ามิติที่ไม่ซ้ำ" : "Distinct ranked dimension values",
       icon: Database,
     },
     totalDistinctMeasure: {
       label:
         metricLabels.totalDistinctMeasure ??
-        `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+        isThai
+          ? `${formatValue((summary as Record<string, unknown>).measureName, "ตัวชี้วัด")}ทั้งหมด`
+          : `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
       value: (summary as Record<string, unknown>).totalDistinctMeasure as number | string | undefined,
-      hint: "Distinct values included in the aggregate",
+      hint: isThai ? "จำนวนค่าที่ไม่ซ้ำในผลรวม" : "Distinct values included in the aggregate",
       icon: Users,
     },
     topDimensionValue: {
       label:
         metricLabels.topDimensionValue ??
-        `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+        isThai
+          ? `${formatValue((summary as Record<string, unknown>).measureName, "ตัวชี้วัด")}สูงสุด`
+          : `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
       value: (summary as Record<string, unknown>).topDimensionValue as number | string | undefined,
-      hint: formatValue((summary as Record<string, unknown>).topDimensionLabel, "Top value"),
+      hint: formatValue((summary as Record<string, unknown>).topDimensionLabel, isThai ? "ค่าสูงสุด" : "Top value"),
       icon: Users,
     },
   };
@@ -1362,18 +1405,18 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
         <table className="min-w-[760px] text-left text-xs">
           <thead className="bg-muted/30 text-muted-foreground">
             <tr>
-              <th className="px-3 py-2 font-medium">Time</th>
-              <th className="px-3 py-2 font-medium">Event</th>
-              <th className="px-3 py-2 font-medium">Course</th>
-              <th className="px-3 py-2 font-medium">User</th>
-              <th className="px-3 py-2 font-medium">Context</th>
+              <th className="px-3 py-2 font-medium">{isThai ? "เวลา" : "Time"}</th>
+              <th className="px-3 py-2 font-medium">{isThai ? "กิจกรรม" : "Event"}</th>
+              <th className="px-3 py-2 font-medium">{isThai ? "หลักสูตร" : "Course"}</th>
+              <th className="px-3 py-2 font-medium">{isThai ? "ผู้ใช้งาน" : "User"}</th>
+              <th className="px-3 py-2 font-medium">{isThai ? "บริบท" : "Context"}</th>
             </tr>
           </thead>
           <tbody>
             {records.slice(0, 8).map((record, index) => (
               <tr key={`${record.timestamp ?? record["@timestamp"] ?? index}`} className="border-t border-border">
                 <td className="px-3 py-2">{formatDateTime(record["@timestamp"] ?? record.timestamp)}</td>
-                <td className="px-3 py-2">{String(record.event ?? record.event_type ?? "Activity")}</td>
+                <td className="px-3 py-2">{String(record.event ?? record.event_type ?? (isThai ? "กิจกรรม" : "Activity"))}</td>
                 <td className="px-3 py-2">{courseName(record.courseID)}</td>
                 <td className="px-3 py-2">{shortId(record.userID, 8)}</td>
                 <td className="max-w-[260px] px-3 py-2">
@@ -1394,55 +1437,64 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     <section className="overflow-hidden bg-background">
       <div className="border-b border-border p-4">
         <div className="flex flex-col gap-1">
-          <h3 className="text-base font-semibold">{layoutSpec.title ?? "Activity dashboard"}</h3>
+          <h3 className="text-base font-semibold">{layoutSpec.title ?? (isThai ? "แดชบอร์ดข้อมูล" : "Activity dashboard")}</h3>
           {layoutSpec.subtitle ? (
             <p className="max-w-3xl text-sm text-muted-foreground">{layoutSpec.subtitle}</p>
           ) : null}
-          <SourceDisclosure items={sourceItems} />
-          <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} />
+          <SourceDisclosure items={sourceItems} language={language} />
+          <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} language={language} />
         </div>
       </div>
 
-      <div className="grid gap-3 p-4 lg:grid-cols-[minmax(180px,0.8fr)_minmax(360px,2.2fr)]">
-        <div className="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-1">
-          {metricBlocks.map((block, index) => {
-          if (block.type === "metric") {
-            const metric = metricDefs[block.id];
-            if (!metric || metric.value == null) return null;
-            return (
-              <div key={`${block.type}-${block.id}-${index}`} className="min-w-0">
-                <MetricCard
-                  label={metric.label}
-                  value={metric.value}
-                  hint={metric.hint}
-                  icon={metric.icon}
-                />
-              </div>
-            );
-          }
-          return null;
-        })}
-        </div>
-        <div className="min-w-0">
-          {chartBlocks.map((block, index) => {
-          if (block.type === "chart") {
-            const slot = slotById.get(block.slotId);
-            if (!slot?.data?.length) return null;
-            return (
-              <div key={`${block.type}-${block.slotId}-${index}`} className="min-w-0">
-                <ChartSlotCard slot={slot} />
-              </div>
-            );
-          }
-          return null;
-        })}
-        </div>
-        {recordBlocks.map((block, index) => {
-          if (block.type === "records") {
-            return <div key={`${block.type}-${index}`} className="min-w-0 lg:col-span-2">{renderRecords()}</div>;
-          }
-          return null;
-        })}
+      <div className="flex flex-col gap-3 p-4">
+        {metricBlocks.length ? (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {metricBlocks.map((block, index) => {
+              if (block.type !== "metric") return null;
+              const metric = metricDefs[block.id];
+              if (!metric || metric.value == null) return null;
+              return (
+                <div
+                  key={`${block.type}-${block.id}-${index}`}
+                  className={block.span === 2 ? "min-w-0 xl:col-span-2" : "min-w-0"}
+                >
+                  <MetricCard
+                    label={metric.label}
+                    value={metric.value}
+                    hint={metric.hint}
+                    icon={metric.icon}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {chartBlocks.length ? (
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+            {chartBlocks.map((block, index) => {
+              if (block.type !== "chart") return null;
+              const slot = slotById.get(block.slotId);
+              if (!slot?.data?.length) return null;
+              return (
+                <div
+                  key={`${block.type}-${block.slotId}-${index}`}
+                  className={chartUsesFullRow(slot, block.span) ? "min-w-0 xl:col-span-2" : "min-w-0"}
+                >
+                  <ChartSlotCard slot={slot} />
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {recordBlocks.map((block, index) =>
+          block.type === "records" ? (
+            <div key={`${block.type}-${index}`} className="min-w-0">
+              {renderRecords()}
+            </div>
+          ) : null,
+        )}
       </div>
     </section>
   );
@@ -1474,6 +1526,8 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
       { id: "apps", title: "Applications", chartType: "column", field: "appID", data: charts.apps ?? [] },
     ];
   const summary = activity?.summary ?? {};
+  const language = summary.presentationLanguage === "th" ? "th" : "en";
+  const isThai = language === "th";
   const sourceMeta = Object.values(activity?.datasets ?? {})[0];
   const sourceName = humanLabel(sourceMeta?.key ?? records[0]?.source ?? "Matched activity data");
   const eventLeader = charts.events?.[0];
@@ -1488,32 +1542,36 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
       ? `${formatDateTime(recordTimes[0].toISOString())} - ${formatDateTime(recordTimes[recordTimes.length - 1].toISOString())}`
       : recordTimes.length === 1
         ? formatDateTime(recordTimes[0].toISOString())
-        : "No timestamp sample";
+        : (isThai ? "ไม่มีตัวอย่างเวลา" : "No timestamp sample");
   if (!records.length && !Object.keys(charts).length) return null;
 
   const stats = [
     {
-      label: summary.isFullAggregate ? "Total activity rows" : "Sampled rows",
+      label: summary.isFullAggregate
+        ? (isThai ? "รายการกิจกรรมทั้งหมด" : "Total activity rows")
+        : (isThai ? "แถวข้อมูลตัวอย่าง" : "Sampled rows"),
       value: summary.totalRecords ?? summary.sampleRecords ?? records.length,
-      hint: summary.isFullAggregate ? "Full file scan" : "Rows read from the activity stream",
+      hint: summary.isFullAggregate
+        ? (isThai ? "สแกนข้อมูลครบทั้งหมด" : "Full file scan")
+        : (isThai ? "แถวที่อ่านจากข้อมูลกิจกรรม" : "Rows read from the activity stream"),
       icon: ListChecks,
     },
     {
-      label: "Event types",
+      label: isThai ? "ประเภทกิจกรรม" : "Event types",
       value: summary.distinctEvents ?? charts.events?.length ?? 0,
-      hint: "Unique actions in the sample",
+      hint: isThai ? "กิจกรรมที่ไม่ซ้ำในตัวอย่าง" : "Unique actions in the sample",
       icon: MousePointerClick,
     },
     {
-      label: "Courses",
+      label: isThai ? "หลักสูตร" : "Courses",
       value: summary.distinctCourses ?? charts.courses?.length ?? 0,
-      hint: "Course IDs represented",
+      hint: isThai ? "รหัสหลักสูตรที่พบ" : "Course IDs represented",
       icon: BookOpen,
     },
     {
-      label: "Users",
+      label: isThai ? "ผู้ใช้งาน" : "Users",
       value: summary.distinctUsers ?? 0,
-      hint: "Distinct sampled learners",
+      hint: isThai ? "ผู้เรียนที่ไม่ซ้ำในตัวอย่าง" : "Distinct sampled learners",
       icon: Users,
     },
   ];
@@ -1523,15 +1581,16 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
       <div className="p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold">Activity stream overview</p>
+            <p className="text-sm font-semibold">{isThai ? "ภาพรวมข้อมูลกิจกรรม" : "Activity stream overview"}</p>
             <p className="mt-1 max-w-2xl break-words text-xs text-muted-foreground">
-              Sample-based dashboard from <span className="font-medium">{sourceName}</span>.
+              {isThai ? "แดชบอร์ดจากข้อมูล " : "Sample-based dashboard from "}
+              <span className="font-medium">{sourceName}</span>.
               {summary.isFullAggregate
-                ? "Charts summarize the full file scan; table rows are a preview."
-                : "Values summarize retrieved sample records, not the full 11GB file."}
+                ? (isThai ? " กราฟสรุปข้อมูลครบทั้งหมด ส่วนแถวในตารางเป็นตัวอย่าง" : "Charts summarize the full file scan; table rows are a preview.")
+                : (isThai ? " ค่าต่าง ๆ สรุปจากระเบียนตัวอย่างที่เรียกมา" : "Values summarize retrieved sample records, not the full 11GB file.")}
             </p>
-            <SourceDisclosure items={sourceItems} />
-            <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} />
+            <SourceDisclosure items={sourceItems} language={language} />
+            <ReasoningDisclosure trace={activity?.decisionTrace} samples={sourceSampleRows} language={language} />
             </div>
           <div className="flex flex-wrap gap-2 text-xs">
             {sourceMeta?.object_type ? (
@@ -1546,12 +1605,14 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
             ) : null}
             {sourceMeta?.sample_record_count ? (
               <span className="rounded-full border bg-background px-3 py-1 font-medium">
-                {summary.isFullAggregate ? `${formatNumber(summary.totalRecords)} total rows` : `${sourceMeta.sample_record_count} sampled rows`}
+                {summary.isFullAggregate
+                  ? `${formatNumber(summary.totalRecords)} ${isThai ? "แถวทั้งหมด" : "total rows"}`
+                  : `${sourceMeta.sample_record_count} ${isThai ? "แถวตัวอย่าง" : "sampled rows"}`}
               </span>
             ) : null}
             {sourceMeta?.content_sample_ranges ? (
               <span className="rounded-full border bg-background px-3 py-1 font-medium">
-                {sourceMeta.content_sample_ranges} file ranges
+                {sourceMeta.content_sample_ranges} {isThai ? "ช่วงข้อมูล" : "file ranges"}
               </span>
             ) : null}
           </div>
@@ -1582,24 +1643,26 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
         <div className="rounded-lg border bg-background p-3">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             <Database className="h-4 w-4" aria-hidden="true" />
-            Source
+            {isThai ? "แหล่งข้อมูล" : "Source"}
           </div>
           <p className="mt-2 break-words text-sm font-medium">{sourceMeta?.s3_uri ?? sourceName}</p>
         </div>
         <div className="rounded-lg border bg-background p-3">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             <Clock className="h-4 w-4" aria-hidden="true" />
-            Sample time window
+            {isThai ? "ช่วงเวลาของตัวอย่าง" : "Sample time window"}
           </div>
           <p className="mt-2 text-sm font-medium">{timeRange}</p>
         </div>
         <div className="rounded-lg border bg-background p-3">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             <Activity className="h-4 w-4" aria-hidden="true" />
-            Top event
+            {isThai ? "กิจกรรมอันดับสูงสุด" : "Top event"}
           </div>
           <p className="mt-2 text-sm font-medium">
-            {eventLeader ? `${humanLabel(eventLeader.label)} (${formatNumber(eventLeader.value)})` : "No event sample"}
+            {eventLeader
+              ? `${humanLabel(eventLeader.label)} (${formatNumber(eventLeader.value)})`
+              : (isThai ? "ไม่มีตัวอย่างกิจกรรม" : "No event sample")}
           </p>
         </div>
       </div>
@@ -1607,21 +1670,23 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
       {records.length ? (
         <div className="border-t border-border px-4 py-3">
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Sample activity records
+            {isThai ? "ระเบียนกิจกรรมตัวอย่าง" : "Sample activity records"}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            A readable slice of the retrieved activity records. Full identifiers are shortened where needed.
+            {isThai
+              ? "ตัวอย่างระเบียนกิจกรรมที่อ่านได้ง่าย โดยย่อรหัสที่ยาวเมื่อจำเป็น"
+              : "A readable slice of the retrieved activity records. Full identifiers are shortened where needed."}
           </p>
           <div className="mt-3 overflow-x-auto rounded-lg border">
             <table className="w-full min-w-[760px] text-left text-xs">
               <thead className="bg-muted/30 text-muted-foreground">
                 <tr>
-                  <th className="px-3 py-2 font-medium">Time</th>
-                  <th className="px-3 py-2 font-medium">App</th>
-                  <th className="px-3 py-2 font-medium">Category</th>
-                  <th className="px-3 py-2 font-medium">Event</th>
-                  <th className="px-3 py-2 font-medium">Course</th>
-                  <th className="px-3 py-2 font-medium">User</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "เวลา" : "Time"}</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "แอป" : "App"}</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "หมวดหมู่" : "Category"}</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "กิจกรรม" : "Event"}</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "หลักสูตร" : "Course"}</th>
+                  <th className="px-3 py-2 font-medium">{isThai ? "ผู้ใช้งาน" : "User"}</th>
                 </tr>
               </thead>
               <tbody>
