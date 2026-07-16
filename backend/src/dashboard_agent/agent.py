@@ -33,6 +33,7 @@ _settings: Settings | None = None
 _store: Any | None = None
 _duckdb_field_cache: dict[str, dict[str, str]] = {}
 _question_language_cache: dict[str, str] = {}
+_semantic_schema_cache: dict[str, tuple[int, list[dict[str, Any]]]] = {}
 SAMPLE_FIELD_RE = re.compile(r"^\$\.sample_records\[(\d+)\]\.(.+)$")
 HUMAN_LABEL_RE = re.compile(r"([a-z0-9])([A-Z])")
 HUMAN_KEEP_ALL_CAPS = {"API", "CSV", "DB", "ETAG", "ID", "JSON", "LLM", "SQL", "S3", "UI", "URL", "UTC"}
@@ -2123,7 +2124,7 @@ def _duckdb_ranked_dimension_context(
                 old_slot_id=slot_id,
                 new_slot_id=str(split_slot["id"]),
             )
-        if not split_slot:
+        if not split_slot and _is_complex_dashboard_request(question):
             chart_slots.extend(
                 _duckdb_companion_dimension_slots(
                     con,
@@ -4777,39 +4778,302 @@ def _contains_thai(text: str) -> bool:
     return bool(THAI_TEXT_RE.search(text))
 
 
-def _canonicalize_question_for_processing(question: str, *, graph_path: Path | None = None) -> str:
-    if not _contains_thai(question):
-        return _normalize_canonical_analytics_question(question)
-    cached = _question_language_cache.get(question)
+def _canonicalize_question_for_processing(
+    question: str,
+    *,
+    graph_path: Path | None = None,
+    semantic_context: dict[str, Any] | None = None,
+) -> str:
+    cache_key = f"analytics-v4:{question}" if semantic_context else question
+    cached = _question_language_cache.get(cache_key)
     if cached:
         return cached
+    persisted_key = cache_key
     if graph_path is not None:
-        persisted = read_question_translation(graph_path, question)
+        persisted = read_question_translation(graph_path, persisted_key)
         if persisted:
             persisted = _normalize_canonical_analytics_question(persisted)
             persisted = _preserve_source_analytics_intent(question, persisted)
-            _question_language_cache[question] = persisted
-            write_question_translation(graph_path, question, persisted)
+            _question_language_cache[cache_key] = persisted
+            write_question_translation(graph_path, persisted_key, persisted)
             return persisted
     parsed = _invoke_language_json(
         system=(
-            "Translate the user's Thai or Thai-English analytics request into one concise English analytics request. "
-            "Preserve every measure, dimension, filter value, comparison, time grain, ranking, split, and requested chart type. "
-            "Do not answer the request and do not invent fields. Return only JSON: {\"englishQuestion\":\"...\"}."
+            "Interpret the user's analytics request and rewrite it as one precise English canonical analytics query. "
+            "Equivalent precise, conversational, paraphrased, and Thai requests must produce the same canonical query. "
+            "Use candidate graph fields and schema fields as grounding, including semantic mappings such as a natural location phrase "
+            "to an available geographic field. Preserve every requested measure, dimension, filter value, comparison, time grain, "
+            "ranking, split, and chart type. Resolve implicit analytics language such as change month to month into an over-time request. "
+            "When the request compares a primary dimension with a categorical breakdown, use the canonical form "
+            "'show <primary dimension> by number of <measure> split by <secondary dimension>'. "
+            "For time analysis use 'show number of <measure> over time split by <dimension>'. "
+            "For ranking use 'show <dimension> by number of <measure> ranked highest'. "
+            "Keep a genuinely neutral overview neutral. Do not answer the request, invent filters, or add unrelated dimensions. "
+            "Prefer exact candidate field names when they represent the user's concept. "
+            "Return only JSON with canonicalQuestion, intent, measureField, dimensionFields in display order, splitField, "
+            "timeField, timeGrain, ranking, filters as field/value objects, chartType, and confidence."
         ),
-        payload={"question": question},
+        payload={"question": question, **(semantic_context or {})},
     )
-    english = str(parsed.get("englishQuestion") or "").strip() if isinstance(parsed, dict) else ""
+    english = (
+        str(parsed.get("canonicalQuestion") or parsed.get("englishQuestion") or "").strip()
+        if isinstance(parsed, dict)
+        else ""
+    )
+    if isinstance(parsed, dict) and semantic_context:
+        english = _canonical_question_from_semantic_plan(
+            parsed,
+            semantic_context,
+            fallback=english,
+            original_question=question,
+        )
     if not english or _contains_thai(english):
-        english = _fallback_english_question(question)
+        english = _fallback_english_question(question) if _contains_thai(question) else question
     english = _normalize_canonical_analytics_question(english)
     english = _preserve_source_analytics_intent(question, english)
-    _question_language_cache[question] = english
+    _question_language_cache[cache_key] = english
     if graph_path is not None:
-        write_question_translation(graph_path, question, english)
+        write_question_translation(graph_path, persisted_key, english)
     if len(_question_language_cache) > 200:
         _question_language_cache.pop(next(iter(_question_language_cache)))
     return english
+
+
+def _canonical_question_from_semantic_plan(
+    parsed: dict[str, Any],
+    semantic_context: dict[str, Any],
+    *,
+    fallback: str,
+    original_question: str = "",
+) -> str:
+    schema_fields = [
+        str(field)
+        for table in semantic_context.get("schemaCatalog") or []
+        if isinstance(table, dict)
+        for field in table.get("fields") or []
+        if field
+    ]
+    graph_fields = [
+        str(field)
+        for field in (semantic_context.get("graphCandidates") or {}).get("fields") or []
+        if field
+    ]
+    allowed_fields = list(dict.fromkeys([*schema_fields, *graph_fields]))
+
+    def resolve(raw_field: Any) -> str:
+        value = str(raw_field or "").strip()
+        if not value:
+            return ""
+        exact = next((field for field in allowed_fields if field.lower() == value.lower()), "")
+        if exact:
+            return exact
+        intent_terms = set(_intent_terms(value))
+        scored = sorted(
+            (
+                (_dimension_field_score(field, value, intent_terms), field)
+                for field in allowed_fields
+            ),
+            key=lambda item: (-item[0], item[1]),
+        )
+        return scored[0][1] if scored and scored[0][0] >= 10 else ""
+
+    measure = resolve(parsed.get("measureField"))
+    raw_dimensions = parsed.get("dimensionFields")
+    if not isinstance(raw_dimensions, list):
+        raw_dimensions = [raw_dimensions] if raw_dimensions else []
+    dimensions = [
+        field
+        for raw_field in raw_dimensions
+        for field in [resolve(raw_field)]
+        if field
+    ]
+    dimensions = list(dict.fromkeys(dimensions))[:4]
+    split_field = resolve(parsed.get("splitField"))
+    time_field = resolve(parsed.get("timeField"))
+    if _semantic_time_intent(original_question or fallback):
+        if not time_field:
+            time_candidates = [field for field in allowed_fields if _semantic_time_field(field)]
+            time_candidates.sort(
+                key=lambda field: (
+                    -_field_score(field, set(_intent_terms(original_question or fallback))),
+                    -len(_field_terms(field) & _field_terms(measure)),
+                    field,
+                )
+            )
+            time_field = time_candidates[0] if time_candidates else ""
+        if not dimensions:
+            dimension_candidates = [
+                field
+                for field in allowed_fields
+                if field != measure
+                and not _semantic_time_field(field)
+                and "id" not in _field_terms(field)
+            ]
+            dimension_candidates.sort(
+                key=lambda field: (
+                    -_dimension_field_score(
+                        field,
+                        original_question or fallback,
+                        set(_intent_terms(original_question or fallback)),
+                    ),
+                    field,
+                )
+            )
+            if dimension_candidates and _dimension_field_score(
+                dimension_candidates[0],
+                original_question or fallback,
+                set(_intent_terms(original_question or fallback)),
+            ) >= 10:
+                dimensions = [dimension_candidates[0]]
+    ranking = bool(parsed.get("ranking")) or str(parsed.get("intent") or "").lower() in {
+        "rank",
+        "ranking",
+        "top",
+    } or bool(re.search(r"\b(?:highest|largest|most|ranked|top)\b", fallback, flags=re.IGNORECASE))
+    if not measure or (not dimensions and not split_field and not time_field):
+        return fallback
+
+    if time_field:
+        canonical = f"show number of {measure} over time"
+        group_field = split_field or (dimensions[0] if dimensions else "")
+        if group_field:
+            canonical += f" split by {group_field}"
+        time_grain = str(parsed.get("timeGrain") or "").strip().lower() or _semantic_time_grain(
+            original_question or fallback
+        )
+        if time_grain and re.fullmatch(r"daily|weekly|monthly|quarterly|yearly", time_grain):
+            canonical += f" {time_grain}"
+    else:
+        primary = dimensions[0] if dimensions else split_field
+        canonical = f"show {primary} by number of {measure}"
+        secondary = split_field if split_field and split_field != primary else ""
+        if not secondary and len(dimensions) > 1:
+            secondary = dimensions[1]
+        if secondary:
+            canonical += f" split by {secondary}"
+        if ranking:
+            canonical += " ranked highest"
+
+    filters = parsed.get("filters") if isinstance(parsed.get("filters"), list) else []
+    filter_clauses: list[str] = []
+    for item in filters[:8]:
+        if not isinstance(item, dict):
+            continue
+        field = resolve(item.get("field"))
+        value = str(item.get("value") or "").strip()
+        if field and value and len(value) <= 80:
+            filter_clauses.append(f"{field} is {value}")
+    if filter_clauses:
+        canonical += " where " + " or ".join(filter_clauses)
+    chart_type = str(parsed.get("chartType") or "").strip().lower().replace("_", " ")
+    if chart_type and chart_type in {
+        "area",
+        "column",
+        "donut",
+        "funnel",
+        "horizontal bar",
+        "line",
+        "pie",
+        "radar",
+        "radial bar",
+        "stacked bar",
+        "stacked column",
+        "treemap",
+    }:
+        canonical += f" as {chart_type} chart"
+    return canonical
+
+
+def _semantic_time_intent(question: str) -> bool:
+    terms = set(_intent_terms(question))
+    return bool(
+        terms
+        & {
+            "change",
+            "changed",
+            "daily",
+            "date",
+            "day",
+            "monthly",
+            "month",
+            "quarter",
+            "quarterly",
+            "time",
+            "timeline",
+            "trend",
+            "week",
+            "weekly",
+            "year",
+            "yearly",
+        }
+    )
+
+
+def _semantic_time_field(field: str) -> bool:
+    terms = _field_terms(field)
+    return bool(terms & {"date", "datetime", "time", "timestamp"}) or field.lower().endswith("_at")
+
+
+def _semantic_time_grain(question: str) -> str:
+    terms = set(_intent_terms(question))
+    for grain, aliases in (
+        ("daily", {"daily", "day"}),
+        ("weekly", {"week", "weekly"}),
+        ("monthly", {"month", "monthly"}),
+        ("quarterly", {"quarter", "quarterly"}),
+        ("yearly", {"year", "yearly"}),
+    ):
+        if terms & aliases:
+            return grain
+    return ""
+
+
+def _seed_question_for_semantic_search(question: str) -> str:
+    if _contains_thai(question):
+        seed = _fallback_english_question(question)
+        return _preserve_source_analytics_intent(question, _normalize_canonical_analytics_question(seed))
+    return _normalize_canonical_analytics_question(question)
+
+
+def _duckdb_semantic_schema(store: Any) -> list[dict[str, Any]]:
+    database_path = _duckdb_database_path(store)
+    if database_path is None or not database_path.exists():
+        return []
+    cache_key = str(database_path.resolve())
+    modified = int(database_path.stat().st_mtime_ns)
+    cached = _semantic_schema_cache.get(cache_key)
+    if cached and cached[0] == modified:
+        return cached[1]
+    try:
+        import duckdb
+
+        con = duckdb.connect(str(database_path), read_only=True)
+        rows = con.execute(
+            """
+            select table_name, column_name
+            from information_schema.columns
+            where table_schema = 'main'
+              and table_name like 'dashboard_agent_%'
+              and table_name not like '%cache%'
+              and table_name not like '%lineage%'
+              and table_name not like '%map%'
+            order by
+              case when table_name like '%fact%' or table_name like '%joined%' then 0 else 1 end,
+              table_name,
+              ordinal_position
+            """
+        ).fetchall()
+        con.close()
+    except Exception:
+        return []
+    tables: dict[str, list[str]] = {}
+    for table_name, column_name in rows:
+        fields = tables.setdefault(str(table_name), [])
+        if len(fields) < 30:
+            fields.append(str(column_name))
+    schema = [{"table": table, "fields": fields} for table, fields in list(tables.items())[:12]]
+    _semantic_schema_cache[cache_key] = (modified, schema)
+    return schema
 
 
 def _normalize_canonical_analytics_question(question: str) -> str:
@@ -5171,9 +5435,26 @@ def _mark_hybrid_execution(activity: dict[str, Any], graph_hints: dict[str, Any]
 def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
     user_question = _last_question(state)
     store = get_store()
-    question = _canonicalize_question_for_processing(user_question, graph_path=store.path)
+    seed_question = _seed_question_for_semantic_search(user_question)
+    if _wants_refresh(user_question):
+        question = seed_question
+    else:
+        seed_results = store.search(seed_question, limit=24)
+        seed_hints = _graph_planning_hints(store, seed_results)
+        question = _canonicalize_question_for_processing(
+            user_question,
+            graph_path=store.path,
+            semantic_context={
+                "graphCandidates": {
+                    "tables": seed_hints.get("tables") or [],
+                    "fields": seed_hints.get("fields") or [],
+                    "evidence": seed_hints.get("evidence") or [],
+                },
+                "schemaCatalog": _duckdb_semantic_schema(store),
+            },
+        )
     notices: list[str] = []
-    wants_refresh = _wants_refresh(question)
+    wants_refresh = _wants_refresh(user_question)
     try:
         if wants_refresh:
             status = refresh_graph(force=True)

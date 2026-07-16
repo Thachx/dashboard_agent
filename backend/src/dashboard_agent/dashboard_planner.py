@@ -841,8 +841,9 @@ def _resolve_value_filters(
     question: str,
 ) -> list[FilterSpec]:
     query_terms = _expanded_terms(question) - STOP_TERMS - ID_TERMS
+    raw_query_terms = _raw_terms(question) - STOP_TERMS - ID_TERMS
     reachable = {plan.base_table, *(join.left_table for join in plan.joins), *(join.right_table for join in plan.joins)}
-    excluded = {(plan.measure.table, plan.measure.name), *((item.table, item.name) for item in plan.dimensions)}
+    excluded = {(plan.measure.table, plan.measure.name)}
     candidates: list[FilterSpec] = []
     for table_name in sorted(reachable):
         for column in catalog[table_name].columns.values():
@@ -859,22 +860,22 @@ def _resolve_value_filters(
                 continue
             for (raw_value,) in rows:
                 value = str(raw_value)
-                value_terms = _terms(value) - STOP_TERMS
-                overlap = value_terms & query_terms
+                value_terms = _raw_terms(value) - STOP_TERMS
+                overlap = value_terms & raw_query_terms
                 if not overlap:
                     continue
                 confidence = min(0.99, 0.72 + len(overlap) * 0.09)
                 candidates.append(FilterSpec(column=column, value=value, confidence=confidence))
     candidates.sort(key=lambda item: (-item.confidence, item.column.table, item.column.name, item.value))
     selected: list[FilterSpec] = []
-    used_columns: set[tuple[str, str]] = set()
+    used_values: set[tuple[str, str, str]] = set()
     for item in candidates:
-        key = (item.column.table, item.column.name)
-        if key in used_columns:
+        key = (item.column.table, item.column.name, item.value.lower())
+        if key in used_values:
             continue
         selected.append(item)
-        used_columns.add(key)
-        if len(selected) >= 3:
+        used_values.add(key)
+        if len(selected) >= 8:
             break
     return selected
 
@@ -882,11 +883,19 @@ def _resolve_value_filters(
 def _filter_sql(plan: AnalyticalPlan, aliases: dict[str, str]) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
+    grouped: dict[tuple[str, str], list[str]] = {}
+    columns: dict[tuple[str, str], ColumnProfile] = {}
     for item in plan.filters:
-        if item.column.table not in aliases:
+        key = (item.column.table, item.column.name)
+        grouped.setdefault(key, []).append(item.value)
+        columns[key] = item.column
+    for key, values in grouped.items():
+        column = columns[key]
+        if column.table not in aliases:
             continue
-        clauses.append(f"lower(cast({_column_sql(item.column, aliases)} as varchar)) = lower(?)")
-        params.append(item.value)
+        placeholders = ", ".join("lower(?)" for _ in values)
+        clauses.append(f"lower(cast({_column_sql(column, aliases)} as varchar)) in ({placeholders})")
+        params.extend(values)
     return (" and " + " and ".join(clauses), params) if clauses else ("", [])
 
 

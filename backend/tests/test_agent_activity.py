@@ -616,6 +616,169 @@ def test_thai_canonical_translation_persists_across_memory_cache(tmp_path, monke
     assert read_question_translation(graph_path, question) == first
 
 
+def test_shared_semantic_interpreter_normalizes_natural_prompt_with_schema_context(tmp_path, monkeypatch):
+    graph_path = tmp_path / "graph.json"
+    question = "where do most learners live?"
+    captured = {}
+
+    def interpret(*, system, payload):
+        captured["system"] = system
+        captured["payload"] = payload
+        return {
+            "canonicalQuestion": "show province by number of users ranked highest",
+            "measureField": "user_id",
+            "dimensionFields": ["province"],
+            "timeField": None,
+            "filters": [],
+            "confidence": 0.96,
+        }
+
+    monkeypatch.setattr(agent, "_invoke_language_json", interpret)
+    agent._question_language_cache.clear()
+    canonical = agent._canonicalize_question_for_processing(
+        question,
+        graph_path=graph_path,
+        semantic_context={
+            "graphCandidates": {"fields": ["province", "user_id"]},
+            "schemaCatalog": [
+                {"table": "dashboard_agent_user_fact", "fields": ["user_id", "province"]}
+            ],
+        },
+    )
+
+    assert canonical == "show province by number of user_id ranked highest"
+    assert captured["payload"]["schemaCatalog"][0]["fields"] == ["user_id", "province"]
+    assert "Equivalent precise" in captured["system"]
+    assert read_question_translation(graph_path, f"analytics-v4:{question}") == canonical
+
+
+def test_shared_semantic_interpreter_has_deterministic_english_fallback(monkeypatch):
+    monkeypatch.setattr(agent, "_invoke_language_json", lambda **_kwargs: None)
+    agent._question_language_cache.clear()
+
+    canonical = agent._canonicalize_question_for_processing(
+        "compare user counts across schools, broken down by study status",
+        semantic_context={"graphCandidates": {}, "schemaCatalog": []},
+    )
+
+    assert canonical == "compare user counts across schools, split by learning status"
+
+
+def test_structured_semantic_plan_generates_fixed_quality_canonical_query():
+    canonical = agent._canonical_question_from_semantic_plan(
+        {
+            "intent": "ranking",
+            "measureField": "user_id",
+            "dimensionFields": ["province"],
+            "splitField": None,
+            "timeField": None,
+            "ranking": True,
+            "filters": [],
+        },
+        {
+            "graphCandidates": {"fields": ["province", "user_id"]},
+            "schemaCatalog": [
+                {"table": "dashboard_agent_user_fact", "fields": ["user_id", "province"]}
+            ],
+        },
+        fallback="where do most learners live?",
+    )
+
+    assert canonical == "show province by number of user_id ranked highest"
+
+
+def test_structured_semantic_plan_recovers_implicit_time_shape_from_schema():
+    canonical = agent._canonical_question_from_semantic_plan(
+        {
+            "intent": "comparison",
+            "measureField": "user_id",
+            "dimensionFields": [],
+            "timeField": None,
+            "filters": [],
+        },
+        {
+            "graphCandidates": {"fields": ["learning_status", "last_activity_date"]},
+            "schemaCatalog": [
+                {
+                    "table": "dashboard_agent_user_fact",
+                    "fields": ["user_id", "learning_status", "last_activity_date"],
+                }
+            ],
+        },
+        fallback="show learning state changes",
+        original_question="how has each learning state changed month to month?",
+    )
+
+    assert canonical == "show number of user_id over time split by learning_status monthly"
+
+
+def test_ranked_prompt_does_not_add_unrequested_companion_charts(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    graph_path = tmp_path / "graph.json"
+    db_path = tmp_path / "dashboard_agent.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        create table dashboard_agent_user_fact (
+            user_id integer,
+            province varchar,
+            learning_status varchar,
+            course_id varchar
+        );
+        insert into dashboard_agent_user_fact values
+            (1, 'Bangkok', 'passed', 'course-a'),
+            (2, 'Bangkok', 'in_progress', 'course-b'),
+            (3, 'Chiang Mai', 'passed', 'course-a');
+        """
+    )
+    con.close()
+
+    activity = agent._duckdb_ranked_dimension_context(
+        FakeStore(graph_path),
+        "show province by number of user_id ranked highest",
+    )
+
+    assert activity
+    assert [slot["field"] for slot in activity["chartSlots"]] == ["province"]
+
+
+def test_complex_planner_supports_multiple_values_for_one_filter(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "multi-filter.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        create table dashboard_agent_enrollment_fact (
+            user_id integer,
+            learning_status varchar,
+            last_activity_date timestamp
+        );
+        insert into dashboard_agent_enrollment_fact values
+            (1, 'passed', '2026-01-01'),
+            (2, 'in_progress', '2026-01-01'),
+            (3, 'inactive', '2026-01-01');
+        """
+    )
+    con.close()
+
+    activity = agent.build_complex_dashboard(
+        db_path,
+        "show number of user_id over time split by learning_status "
+        "where learning_status is passed or learning_status is in_progress",
+    )
+
+    assert activity
+    filters = activity["summary"]["analyticalPlan"]["filters"]
+    assert {item["value"] for item in filters} == {"passed", "in_progress"}
+    series = {
+        row["series"]
+        for slot in activity["chartSlots"]
+        for row in slot["data"]
+        if row.get("series")
+    }
+    assert series == {"passed", "in_progress"}
+
+
 def test_question_translation_cache_round_trip(tmp_path):
     graph_path = tmp_path / "graph.json"
     assert write_question_translation(graph_path, "คำถาม", "question")
