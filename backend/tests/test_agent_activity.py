@@ -245,6 +245,74 @@ def test_complex_planner_uses_graph_hints_to_choose_duckdb_table():
     assert plan.public_dict()["graphHints"]["sourcePaths"] == ["data/beta.json"]
 
 
+def test_neutral_prompt_builds_schema_driven_overview(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    db_path = tmp_path / "neutral.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        create table dashboard_agent_enrollment_fact (
+            user_id integer,
+            learning_status varchar,
+            province varchar,
+            course_type varchar,
+            free_text varchar
+        );
+        insert into dashboard_agent_enrollment_fact values
+            (1, 'passed', 'Bangkok', 'self-paced', 'unique note 1'),
+            (2, 'in_progress', 'Bangkok', 'self-paced', 'unique note 2'),
+            (3, 'passed', 'Chiang Mai', 'instructor-led', 'unique note 3'),
+            (4, 'inactive', 'Phuket', 'self-paced', 'unique note 4');
+        """
+    )
+    con.close()
+
+    activity = agent.build_complex_dashboard(
+        db_path,
+        "tell me about users",
+        graph_hints={
+            "tables": ["dashboard_agent_enrollment_fact"],
+            "fields": ["user_id", "learning_status", "province", "course_type"],
+            "sourcePaths": ["data/enrollments.json"],
+        },
+    )
+
+    assert activity
+    plan = activity["summary"]["analyticalPlan"]
+    assert plan["intent"] == "neutral_overview"
+    assert plan["measure"]["field"] == "user_id"
+    assert {item["field"] for item in plan["dimensions"]} == {
+        "course_type",
+        "learning_status",
+        "province",
+    }
+    assert len(activity["chartSlots"]) == 3
+
+
+def test_explicit_rank_prompt_does_not_fall_back_to_neutral_overview():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    con.execute(
+        """
+        create table dashboard_agent_enrollment_fact (
+            user_id integer,
+            learning_status varchar
+        );
+        insert into dashboard_agent_enrollment_fact values
+            (1, 'passed'),
+            (2, 'in_progress');
+        """
+    )
+
+    plan = plan_complex_dashboard(
+        _catalog(con),
+        "which province has the most users",
+        dimension_profiler=lambda _column: (2, 2),
+    )
+
+    assert plan is None
+
+
 def test_hybrid_execution_records_graph_planning_and_duckdb_calculation():
     activity = {
         "datasets": {"fact": {"object_type": "duckdb_join_plan"}},

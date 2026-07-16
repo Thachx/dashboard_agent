@@ -167,6 +167,7 @@ def build_complex_dashboard(
             catalog,
             question,
             value_validator=lambda column: _column_has_value(con, column),
+            dimension_profiler=lambda column: _column_value_profile(con, column),
             graph_hints=graph_hints,
         )
         if plan is None:
@@ -184,6 +185,7 @@ def plan_complex_dashboard(
     question: str,
     *,
     value_validator: Callable[[ColumnProfile], bool] | None = None,
+    dimension_profiler: Callable[[ColumnProfile], tuple[int, int]] | None = None,
     graph_hints: dict[str, Any] | None = None,
 ) -> AnalyticalPlan | None:
     query_terms = _expanded_terms(question)
@@ -214,11 +216,20 @@ def plan_complex_dashboard(
         value_validator=value_validator,
         graph_hints=graph_hints,
     )
+    neutral_overview = not _has_explicit_analytical_shape(question)
+    if not dimensions and time_dimension is None and neutral_overview:
+        dimensions = _resolve_overview_dimensions(
+            catalog,
+            measure=measure,
+            value_validator=value_validator,
+            dimension_profiler=dimension_profiler,
+            graph_hints=graph_hints,
+        )
     complex_language = any(
         phrase in f" {question.lower()} "
         for phrase in (" and ", " split by ", " grouped by ", " group by ", " compare ", " within ", " for each ")
     )
-    if len(dimensions) < 2 and not complex_language:
+    if len(dimensions) < 2 and not complex_language and not neutral_overview:
         return None
     if not dimensions and time_dimension is None:
         return None
@@ -253,7 +264,11 @@ def plan_complex_dashboard(
     if " split by " in f" {question.lower()} " and len(dimensions) == 2 and not joins and time_dimension is None:
         # The existing split-series planner has a richer stacked encoding for this compact shape.
         return None
-    intent = "time_comparison" if time_dimension else "multi_dimension_comparison"
+    intent = (
+        "neutral_overview"
+        if neutral_overview
+        else ("time_comparison" if time_dimension else "multi_dimension_comparison")
+    )
     return AnalyticalPlan(
         intent=intent,
         base_table=base_table,
@@ -417,6 +432,50 @@ def _resolve_dimensions(
         if len(selected) >= 4:
             break
     return selected
+
+
+def _resolve_overview_dimensions(
+    catalog: dict[str, TableProfile],
+    *,
+    measure: ColumnProfile,
+    value_validator: Callable[[ColumnProfile], bool] | None,
+    dimension_profiler: Callable[[ColumnProfile], tuple[int, int]] | None,
+    graph_hints: dict[str, Any],
+) -> list[ColumnProfile]:
+    preferred_fields = {str(value).lower() for value in graph_hints.get("fields") or [] if value}
+    candidates: list[tuple[float, ColumnProfile]] = []
+    for table in catalog.values():
+        for column in table.columns.values():
+            if column == measure or column.is_identifier or column.is_time:
+                continue
+            if _is_numeric_type(column.data_type) or column.terms & NON_DIMENSION_PARTS:
+                continue
+            if value_validator is not None and not value_validator(column):
+                continue
+            score = _graph_column_hint_score(column, graph_hints)
+            if column.table == measure.table:
+                score += 24.0
+            if "fact" in column.table or "joined" in column.table:
+                score += 3.0
+            candidates.append((score, column))
+
+    candidates.sort(key=lambda item: (-item[0], item[1].table, item[1].name))
+    chartable: list[tuple[float, ColumnProfile]] = []
+    for score, column in candidates[:32]:
+        if dimension_profiler is None:
+            chartable.append((score, column))
+            continue
+        sampled_rows, distinct_values = dimension_profiler(column)
+        if sampled_rows < 2 or distinct_values < 2:
+            continue
+        max_distinct = 2000 if column.name.lower() in preferred_fields else 100
+        if distinct_values > max_distinct or distinct_values / sampled_rows > 0.8:
+            continue
+        cardinality_score = max(0.0, 8.0 - distinct_values / 12.5)
+        chartable.append((score + cardinality_score, column))
+
+    chartable.sort(key=lambda item: (-item[0], item[1].table, item[1].name))
+    return [column for _, column in chartable[:3]]
 
 
 def _select_base_table(
@@ -839,6 +898,53 @@ def _column_has_value(con: Any, column: ColumnProfile) -> bool:
         return row is not None
     except Exception:
         return False
+
+
+def _column_value_profile(con: Any, column: ColumnProfile, *, sample_size: int = 5000) -> tuple[int, int]:
+    try:
+        row = con.execute(
+            f"""
+            select count(*), count(distinct value)
+            from (
+                select cast({_quote(column.name)} as varchar) as value
+                from {_quote(column.table)}
+                where {_quote(column.name)} is not null
+                  and cast({_quote(column.name)} as varchar) <> ''
+                limit {int(sample_size)}
+            ) sampled_values
+            """
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
+    except Exception:
+        return 0, 0
+
+
+def _has_explicit_analytical_shape(question: str) -> bool:
+    raw_terms = _raw_terms(question)
+    return bool(
+        raw_terms
+        & {
+            "breakdown",
+            "compare",
+            "comparison",
+            "composition",
+            "distribution",
+            "group",
+            "grouped",
+            "highest",
+            "largest",
+            "most",
+            "rank",
+            "ranking",
+            "split",
+            "time",
+            "timeline",
+            "top",
+            "trend",
+            "versus",
+            "vs",
+        }
+    )
 
 
 def _terms(value: str) -> set[str]:
