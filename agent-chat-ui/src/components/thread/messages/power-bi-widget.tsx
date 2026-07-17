@@ -1154,7 +1154,7 @@ function TreemapChartCard({ data, title }: { data: ChartDatum[]; title: string }
       <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </p>
-      <div className="mt-3 h-60">
+      <div className="mt-3 h-48">
         <ResponsiveContainer width="100%" height="100%">
           <Treemap
             data={chartData}
@@ -1263,6 +1263,46 @@ function chartUsesFullRow(slot: ChartSlot, requestedSpan?: number) {
   return ["multi_line", "line", "area", "stacked_column", "stacked_bar", "treemap"].includes(
     slot.chartType,
   );
+}
+
+function chartUsesCompactColumn(slot: ChartSlot) {
+  return ["donut", "pie", "radar", "radial_bar", "stat"].includes(slot.chartType);
+}
+
+function chartGridSpans(
+  charts: Array<{ slot: ChartSlot; requestedSpan?: number }>,
+) {
+  const spans = Array.from({ length: charts.length }, () => 12);
+  let index = 0;
+
+  while (index < charts.length) {
+    const current = charts[index];
+    if (chartUsesFullRow(current.slot, current.requestedSpan)) {
+      index += 1;
+      continue;
+    }
+
+    const next = charts[index + 1];
+    if (!next || chartUsesFullRow(next.slot, next.requestedSpan)) {
+      index += 1;
+      continue;
+    }
+
+    const currentCompact = chartUsesCompactColumn(current.slot);
+    const nextCompact = chartUsesCompactColumn(next.slot);
+    spans[index] = currentCompact === nextCompact ? 6 : currentCompact ? 5 : 7;
+    spans[index + 1] = currentCompact === nextCompact ? 6 : nextCompact ? 5 : 7;
+    index += 2;
+  }
+
+  return spans;
+}
+
+function chartSpanClass(span: number) {
+  if (span === 5) return "xl:col-span-5";
+  if (span === 6) return "xl:col-span-6";
+  if (span === 7) return "xl:col-span-7";
+  return "xl:col-span-12";
 }
 
 function DashboardBarChart({
@@ -1432,6 +1472,14 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
   const metricBlocks = layoutSpec.blocks.filter((block) => block.type === "metric");
   const chartBlocks = layoutSpec.blocks.filter((block) => block.type === "chart");
   const recordBlocks = layoutSpec.blocks.filter((block) => block.type === "records");
+  const visibleCharts = chartBlocks.flatMap((block, index) => {
+    if (block.type !== "chart") return [];
+    const slot = slotById.get(block.slotId);
+    return slot?.data?.length ? [{ block, index, slot }] : [];
+  });
+  const visibleChartSpans = chartGridSpans(
+    visibleCharts.map(({ block, slot }) => ({ slot, requestedSpan: block.span })),
+  );
 
   return (
     <section className="overflow-hidden bg-background">
@@ -1447,8 +1495,15 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
       </div>
 
       <div className="flex flex-col gap-3 p-4">
+        <div
+          className={
+            metricBlocks.length && visibleCharts.length
+              ? "grid gap-3 xl:grid-cols-[minmax(220px,280px)_minmax(0,1fr)] xl:items-start"
+              : "grid gap-3"
+          }
+        >
         {metricBlocks.length ? (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-1">
             {metricBlocks.map((block, index) => {
               if (block.type !== "metric") return null;
               const metric = metricDefs[block.id];
@@ -1456,7 +1511,7 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
               return (
                 <div
                   key={`${block.type}-${block.id}-${index}`}
-                  className={block.span === 2 ? "min-w-0 xl:col-span-2" : "min-w-0"}
+                  className="min-w-0"
                 >
                   <MetricCard
                     label={metric.label}
@@ -1470,20 +1525,14 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
           </div>
         ) : null}
 
-        {chartBlocks.length ? (
-          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-            {chartBlocks.map((block, index) => {
-              if (block.type !== "chart") return null;
-              const slot = slotById.get(block.slotId);
-              if (!slot?.data?.length) return null;
+        {visibleCharts.length ? (
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
+            {visibleCharts.map(({ block, index, slot }, visibleIndex) => {
+              const span = visibleChartSpans[visibleIndex] ?? 12;
               return (
                 <div
                   key={`${block.type}-${block.slotId}-${index}`}
-                  className={
-                    chartUsesFullRow(slot, block.span)
-                      ? "h-full min-w-0 xl:col-span-2 [&>*]:h-full"
-                      : "h-full min-w-0 [&>*]:h-full"
-                  }
+                  className={`h-full min-w-0 [&>*]:h-full ${chartSpanClass(span)}`}
                 >
                   <ChartSlotCard slot={slot} />
                 </div>
@@ -1491,6 +1540,7 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
             })}
           </div>
         ) : null}
+        </div>
 
         {recordBlocks.map((block, index) =>
           block.type === "records" ? (
