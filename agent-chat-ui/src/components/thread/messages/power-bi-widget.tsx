@@ -768,8 +768,8 @@ function DonutChartCard({ data, title }: { data: ChartDatum[]; title: string }) 
       <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
         {title}
       </p>
-      <div className="mt-3 grid gap-3 sm:grid-cols-[140px_1fr]">
-        <div className="relative h-36">
+      <div className="mt-3 grid min-h-44 gap-3 sm:grid-cols-[160px_1fr]">
+        <div className="relative h-44">
           <ResponsiveContainer width="100%" height="100%">
             <PieChart>
               <Pie
@@ -1260,7 +1260,7 @@ function ChartSlotCard({
 function chartUsesFullRow(slot: ChartSlot, requestedSpan?: number) {
   if (requestedSpan !== 2) return false;
   if (slot.data.some((item) => item.series)) return true;
-  return ["multi_line", "line", "area", "stacked_column", "stacked_bar"].includes(
+  return ["multi_line", "line", "area", "stacked_column", "stacked_bar", "treemap"].includes(
     slot.chartType,
   );
 }
@@ -1479,7 +1479,11 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
               return (
                 <div
                   key={`${block.type}-${block.slotId}-${index}`}
-                  className={chartUsesFullRow(slot, block.span) ? "min-w-0 xl:col-span-2" : "min-w-0"}
+                  className={
+                    chartUsesFullRow(slot, block.span)
+                      ? "h-full min-w-0 xl:col-span-2 [&>*]:h-full"
+                      : "h-full min-w-0 [&>*]:h-full"
+                  }
                 >
                   <ChartSlotCard slot={slot} />
                 </div>
