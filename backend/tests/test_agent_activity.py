@@ -287,6 +287,11 @@ def test_neutral_prompt_builds_schema_driven_overview(tmp_path):
         "province",
     }
     assert len(activity["chartSlots"]) == 3
+    assert {slot["chartType"] for slot in activity["chartSlots"]} == {
+        "column",
+        "donut",
+        "horizontal_bar",
+    }
 
 
 def test_explicit_rank_prompt_does_not_fall_back_to_neutral_overview():
@@ -383,6 +388,37 @@ def test_chart_type_choices_only_accept_compatible_renderers():
     assert activity["chartSlots"][0]["chartType"] == "radar"
     assert activity["chartSlots"][1]["chartType"] == "multi_line"
     assert agent._prompt_chart_type_choice("show the composition as a pie chart") == "pie"
+
+
+def test_llm_chart_choices_do_not_collapse_meaningful_variety():
+    slots = [
+        {
+            "id": "status",
+            "chartType": "donut",
+            "data": [{"label": "passed", "value": 10}, {"label": "active", "value": 8}],
+        },
+        {
+            "id": "department",
+            "chartType": "column",
+            "data": [{"label": "A", "value": 10}, {"label": "B", "value": 8}],
+        },
+        {
+            "id": "teacher",
+            "chartType": "treemap",
+            "data": [{"label": "One", "value": 10}, {"label": "Two", "value": 8}],
+        },
+    ]
+
+    choices = agent._preserve_meaningful_chart_variety(
+        slots,
+        {"status": "horizontal_bar", "department": "horizontal_bar", "teacher": "horizontal_bar"},
+    )
+
+    assert choices == {
+        "status": "horizontal_bar",
+        "department": "column",
+        "teacher": "treemap",
+    }
 
 
 def test_duckdb_fallback_is_persisted_and_reused_as_graph_aggregate(tmp_path):

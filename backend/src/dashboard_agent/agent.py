@@ -4229,6 +4229,31 @@ def _apply_chart_type_choices(activity: dict[str, Any], choices: Any) -> dict[st
     return activity
 
 
+def _preserve_meaningful_chart_variety(slots: list[dict[str, Any]], choices: Any) -> Any:
+    if not isinstance(choices, dict):
+        return choices
+    categorical_slots = [
+        slot
+        for slot in slots
+        if isinstance(slot, dict)
+        and not any(isinstance(item, dict) and item.get("series") for item in slot.get("data") or [])
+        and len(slot.get("data") or []) > 1
+    ]
+    if len(categorical_slots) < 3:
+        return choices
+    proposed = [
+        str(choices.get(str(slot.get("id"))) or slot.get("chartType") or "")
+        for slot in categorical_slots
+    ]
+    current = {str(slot.get("chartType") or "") for slot in categorical_slots}
+    if len(set(proposed)) != 1 or len(current) < 2:
+        return choices
+    balanced = dict(choices)
+    for slot in categorical_slots[1:]:
+        balanced[str(slot.get("id"))] = str(slot.get("chartType") or "horizontal_bar")
+    return balanced
+
+
 def _prompt_chart_type_choice(question: str) -> str:
     lowered = question.lower()
     chart_phrases = {
@@ -4298,7 +4323,9 @@ def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> di
                 "horizontal_bar for ranking and long labels; column for compact comparison; donut or pie for part-to-whole with few categories; "
                 "treemap for hierarchical composition; radar only for comparing a small common profile; radial_bar for a compact circular comparison; "
                 "funnel only for ordered stages; stacked_bar or stacked_column for composition split by a second dimension. "
-                "Prefer the simplest truthful chart and do not use every available type merely for variety."
+                "Preserve a current chart type when it already matches the analytical job. When a dashboard has several categorical slots "
+                "with different shapes, keep meaningful visual variety instead of changing every slot to a bar chart. "
+                "Prefer the simplest truthful chart and never choose radar, funnel, or pie merely for decoration."
             ),
         ),
         (
@@ -4329,7 +4356,8 @@ def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> di
         parsed = json.loads(str(model.invoke(messages).content))
         if not isinstance(parsed, dict):
             return activity
-        _apply_chart_type_choices(activity, parsed.get("chartTypes"))
+        choices = _preserve_meaningful_chart_variety(slots, parsed.get("chartTypes"))
+        _apply_chart_type_choices(activity, choices)
         layout = activity.get("layoutSpec") if isinstance(activity.get("layoutSpec"), dict) else {}
         if isinstance(parsed.get("title"), str) and parsed["title"].strip():
             layout["title"] = parsed["title"].strip()[:100]

@@ -671,6 +671,7 @@ def _execute_plan(con: Any, plan: AnalyticalPlan, question: str) -> dict[str, An
             slots.append({"id": "plan-time", "title": f"{_measure_display(plan.measure.name)} over time", "chartType": "line", "field": plan.time_dimension.name, "data": data})
             blocks.append({"type": "chart", "slotId": "plan-time", "span": 2})
 
+    used_chart_types = {str(slot.get("chartType") or "") for slot in slots}
     for index, dimension in enumerate(plan.dimensions):
         if plan.time_dimension is not None and index == 0:
             continue
@@ -687,7 +688,14 @@ def _execute_plan(con: Any, plan: AnalyticalPlan, question: str) -> dict[str, An
             continue
         data = [{"label": str(label), "value": int(value)} for label, value in rows]
         slot_id = f"plan-{_slug(dimension.name)}"
-        chart_type = _categorical_chart_type(question, dimension.name, len(data))
+        chart_preferences = _categorical_chart_preferences(question, dimension.name, len(data))
+        chart_type = chart_preferences[0]
+        if not _requested_categorical_chart_type(question):
+            chart_type = next(
+                (candidate for candidate in chart_preferences if candidate not in used_chart_types),
+                chart_type,
+            )
+        used_chart_types.add(chart_type)
         slots.append({
             "id": slot_id,
             "title": f"{_measure_display(plan.measure.name)} by {_display(dimension.name)}",
@@ -1058,6 +1066,10 @@ def _measure_display(value: str) -> str:
 
 
 def _categorical_chart_type(question: str, field: str, cardinality: int) -> str:
+    return _categorical_chart_preferences(question, field, cardinality)[0]
+
+
+def _requested_categorical_chart_type(question: str) -> str:
     lowered = question.lower()
     requested = {
         "donut": ("donut", "ring chart"),
@@ -1071,17 +1083,31 @@ def _categorical_chart_type(question: str, field: str, cardinality: int) -> str:
     }
     for chart_type, phrases in requested.items():
         if any(phrase in lowered for phrase in phrases):
-            if chart_type in {"donut", "pie", "radar", "radial_bar"} and cardinality > 8:
-                break
             return chart_type
+    return ""
+
+
+def _categorical_chart_preferences(question: str, field: str, cardinality: int) -> list[str]:
+    lowered = question.lower()
+    explicitly_requested = _requested_categorical_chart_type(question)
+    if explicitly_requested:
+        if explicitly_requested in {"donut", "pie", "radar", "radial_bar"} and cardinality > 8:
+            return ["horizontal_bar", "treemap", "column"]
+        return [explicitly_requested]
     field_terms = _raw_terms(field)
     if field_terms & {"stage", "step", "funnel"} and 2 <= cardinality <= 8:
-        return "funnel"
+        return ["funnel", "column", "horizontal_bar"]
     if any(term in lowered for term in ("composition", "share", "percentage", "proportion")) and cardinality <= 8:
-        return "donut"
-    if any(term in lowered for term in ("distribution", "compare")) and cardinality <= 6:
-        return "column"
-    return "horizontal_bar"
+        return ["donut", "column", "horizontal_bar"]
+    if any(term in lowered for term in ("rank", "ranking", "top", "most", "highest", "largest")):
+        return ["horizontal_bar", "treemap", "column"]
+    if field_terms & {"status", "state", "category", "type", "result"} and 2 <= cardinality <= 6:
+        return ["donut", "column", "horizontal_bar"]
+    if 9 <= cardinality <= 20:
+        return ["treemap", "horizontal_bar", "column"]
+    if 2 <= cardinality <= 8:
+        return ["column", "donut", "horizontal_bar"]
+    return ["horizontal_bar", "treemap", "column"]
 
 
 def _slug(value: str) -> str:
