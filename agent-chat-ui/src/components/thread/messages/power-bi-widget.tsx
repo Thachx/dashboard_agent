@@ -1409,9 +1409,9 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     distinctDimensionValues: {
       label:
         metricLabels.distinctDimensionValues ??
-        isThai
+        (isThai
           ? `จำนวน${formatValue((summary as Record<string, unknown>).topDimensionName, "มิติข้อมูล")}ที่ไม่ซ้ำ`
-          : `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`,
+          : `${formatValue((summary as Record<string, unknown>).topDimensionName, "Dimension")} values`),
       value: (summary as Record<string, unknown>).distinctDimensionValues as number | string | undefined,
       hint: isThai ? "จำนวนค่ามิติที่ไม่ซ้ำ" : "Distinct ranked dimension values",
       icon: Database,
@@ -1419,9 +1419,9 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     totalDistinctMeasure: {
       label:
         metricLabels.totalDistinctMeasure ??
-        isThai
+        (isThai
           ? `${formatValue((summary as Record<string, unknown>).measureName, "ตัวชี้วัด")}ทั้งหมด`
-          : `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+          : `Total ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`),
       value: (summary as Record<string, unknown>).totalDistinctMeasure as number | string | undefined,
       hint: isThai ? "จำนวนค่าที่ไม่ซ้ำในผลรวม" : "Distinct values included in the aggregate",
       icon: Users,
@@ -1429,9 +1429,9 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
     topDimensionValue: {
       label:
         metricLabels.topDimensionValue ??
-        isThai
+        (isThai
           ? `${formatValue((summary as Record<string, unknown>).measureName, "ตัวชี้วัด")}สูงสุด`
-          : `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`,
+          : `Top ${formatValue((summary as Record<string, unknown>).measureName, "measure")}`),
       value: (summary as Record<string, unknown>).topDimensionValue as number | string | undefined,
       hint: formatValue((summary as Record<string, unknown>).topDimensionLabel, isThai ? "ค่าสูงสุด" : "Top value"),
       icon: Users,
