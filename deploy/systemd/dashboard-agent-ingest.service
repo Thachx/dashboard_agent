@@ -1,0 +1,17 @@
+[Unit]
+Description=Dashboard Agent hourly S3 to DuckDB ingestion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dashboard_agent/backend
+EnvironmentFile=-%h/dashboard_agent/backend/.env
+ExecStart=%h/dashboard_agent/backend/.venv/bin/python %h/dashboard_agent/backend/run_s3_duckdb_pipeline.py --lock-timeout-seconds 60
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=default.target

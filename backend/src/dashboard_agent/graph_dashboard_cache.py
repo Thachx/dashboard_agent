@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 24
 MAX_CACHE_ENTRIES = 100
 CACHE_LOCK = threading.Lock()
 LANGUAGE_CACHE_LOCK = threading.Lock()
@@ -34,7 +34,12 @@ ALIASES = {
 }
 
 
-def read_graph_dashboard_cache(graph_path: str | Path, question: str) -> dict[str, Any]:
+def read_graph_dashboard_cache(
+    graph_path: str | Path,
+    question: str,
+    *,
+    source_version: str = "",
+) -> dict[str, Any]:
     path = _cache_path(Path(graph_path))
     if not path.exists():
         return {}
@@ -42,40 +47,37 @@ def read_graph_dashboard_cache(graph_path: str | Path, question: str) -> dict[st
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
+        return {}
+    entries = payload.get("entries")
     if not isinstance(entries, list):
         return {}
+    if not _normalized_is_cacheable(question):
+        return {}
     normalized = _normalize_question(question)
-    terms = _semantic_terms(question)
-    intent = _intent_shape(question)
-    candidates: list[tuple[float, dict[str, Any]]] = []
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("activity"), dict):
             continue
-        if entry.get("normalized_question") == normalized:
-            candidates.append((2.0, entry))
+        if source_version and entry.get("source_version") != source_version:
             continue
-        if entry.get("intent") != intent:
+        if entry.get("normalized_question") != normalized:
             continue
-        cached_terms = {str(term) for term in entry.get("semantic_terms") or []}
-        if not terms or not cached_terms:
-            continue
-        intersection = terms & cached_terms
-        containment = len(intersection) / max(min(len(terms), len(cached_terms)), 1)
-        union_score = len(intersection) / max(len(terms | cached_terms), 1)
-        if containment >= 0.9 and union_score >= 0.72:
-            candidates.append((containment + union_score, entry))
-    if not candidates:
-        return {}
-    candidates.sort(key=lambda item: (-item[0], -float(item[1].get("updated_at") or 0)))
-    entry = candidates[0][1]
-    activity = deepcopy(entry["activity"])
-    _mark_graph_hit(activity, str(entry.get("question") or ""))
-    return activity
+        activity = deepcopy(entry["activity"])
+        _mark_graph_hit(activity, str(entry.get("question") or ""))
+        return activity
+    return {}
 
 
-def write_graph_dashboard_cache(graph_path: str | Path, question: str, activity: dict[str, Any]) -> bool:
+def write_graph_dashboard_cache(
+    graph_path: str | Path,
+    question: str,
+    activity: dict[str, Any],
+    *,
+    source_version: str = "",
+) -> bool:
     if not _is_duckdb_activity(activity):
+        return False
+    if not _normalized_is_cacheable(question):
         return False
     path = _cache_path(Path(graph_path))
     entry = {
@@ -84,6 +86,7 @@ def write_graph_dashboard_cache(graph_path: str | Path, question: str, activity:
         "normalized_question": _normalize_question(question),
         "semantic_terms": sorted(_semantic_terms(question)),
         "intent": _intent_shape(question),
+        "source_version": source_version,
         "updated_at": time.time(),
         "activity": deepcopy(activity),
     }
@@ -114,7 +117,9 @@ def read_question_translation(graph_path: str | Path, question: str) -> str:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return ""
-    translations = payload.get("translations") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION:
+        return ""
+    translations = payload.get("translations")
     if not isinstance(translations, dict):
         return ""
     entry = translations.get(_translation_key(question))
@@ -166,19 +171,25 @@ def _mark_graph_hit(activity: dict[str, Any], matched_question: str) -> None:
     if isinstance(summary, dict):
         summary["executionSource"] = "graph"
         summary["graphCacheMatchedQuestion"] = matched_question
-        reasoning_is_current = (
-            summary.get("reasoningSource") == "agent"
-            and summary.get("reasoningExecutionSource") == "graph"
-        )
-    else:
-        reasoning_is_current = False
+        summary["reasoningSource"] = "cache"
+        summary["reasoningExecutionSource"] = "graph"
     datasets = activity.get("datasets")
     if isinstance(datasets, dict):
         for metadata in datasets.values():
             if isinstance(metadata, dict):
                 metadata["object_type"] = "graph_dashboard_aggregate"
-    if not reasoning_is_current:
-        activity["decisionTrace"] = []
+    activity["decisionTrace"] = [
+        {
+            "stage": "Reuse verified result",
+            "detail": "Reused a matching precomputed dashboard whose source version is unchanged.",
+            "evidence": [f"matched request: {matched_question}"],
+        },
+        {
+            "stage": "Preserve chart binding",
+            "detail": "Preserved the verified dimensions, measures, filters, and chart data from the cached result.",
+            "evidence": ["execution source: graph dashboard aggregate"],
+        },
+    ]
 
 
 def _is_duckdb_activity(activity: dict[str, Any]) -> bool:
@@ -204,6 +215,16 @@ def _language_cache_path(graph_path: Path) -> Path:
 
 def _translation_key(question: str) -> str:
     return hashlib.sha256(question.strip().encode("utf-8")).hexdigest()
+
+
+MIN_NORMALIZED_LENGTH = 8
+
+
+def _normalized_is_cacheable(question: str) -> bool:
+    """Scripts and Thai-only prompts can normalize to near-empty keys; those
+    would all collide on one cache slot, so they bypass the cache entirely."""
+
+    return len(_normalize_question(question).strip()) >= MIN_NORMALIZED_LENGTH
 
 
 def _normalize_question(question: str) -> str:

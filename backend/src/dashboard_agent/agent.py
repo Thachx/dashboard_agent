@@ -12,6 +12,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from dashboard_agent.config import Settings
+from dashboard_agent.dashboard_pattern_compiler import (
+    FACT_TABLE,
+    compile_analytical_pattern,
+    detect_pattern,
+    wants_text_only,
+)
 from dashboard_agent.dashboard_planner import build_complex_dashboard
 from dashboard_agent.dashboard_widget import dataset_summaries, graph_dashboard_marker
 from dashboard_agent.graph_dashboard_cache import (
@@ -478,6 +484,7 @@ def _primary_group_dimension_terms(question: str) -> set[str]:
 def _primary_ranked_dimension_terms(question: str) -> set[str]:
     lowered = f" {question.lower()} "
     patterns = [
+        r"\b(?:top|most|highest|largest)\s+\d+\s+(?:non[- ]?blank|non[- ]?empty|populated|named)?\s*([a-z0-9 _-]+?)\s+by\b",
         r"\b(?:which|what)\s+([a-z0-9 _-]+?)\s+(?:has|have|had|contains?|includes?)\b",
         r"\b(?:top|most|highest|largest)\s+([a-z0-9 _-]+?)\s+by\b",
         r"\bshow\s+([a-z0-9 _-]+?)\s+by\b",
@@ -3067,6 +3074,11 @@ def _is_dimension_column(column: str) -> bool:
 def _ranked_dimension_score(column: str, intent_terms: set[str], question: str = "") -> float:
     score = _dimension_field_score(column, question, intent_terms) if question else _field_score(column, intent_terms)
     field_terms = _field_terms(column)
+    normalized_question = question.lower().replace("_", " ")
+    normalized_question = re.sub(r"\b([a-z]{4,})s\b", r"\1", normalized_question)
+    normalized_field = " ".join(part for part in column.lower().replace("_", " ").split() if part != "name")
+    if normalized_field and normalized_field in normalized_question:
+        score += float(len(normalized_field.split()) * 100)
     if "name" in field_terms:
         score += 1.5
     if {"school", "institute"} & intent_terms and {"school", "institute"} & field_terms:
@@ -3198,7 +3210,13 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
 
 
 def _infer_duckdb_json_fields(con: Any, source_path: str) -> dict[str, str]:
-    cached = _duckdb_field_cache.get(source_path)
+    # Bucket by 10-minute wall-clock windows so inferred fields re-derive after
+    # hourly data refreshes instead of serving stale schema guesses forever.
+    bucket = int(time.time() // 600)
+    cache_key = f"{bucket}:{source_path}"
+    for stale_key in [key for key in _duckdb_field_cache if not key.startswith(f"{bucket}:")]:
+        _duckdb_field_cache.pop(stale_key, None)
+    cached = _duckdb_field_cache.get(cache_key)
     if cached is not None:
         return cached
     try:
@@ -3230,7 +3248,7 @@ def _infer_duckdb_json_fields(con: Any, source_path: str) -> dict[str, str]:
         "course": _choose_field(fields, ("courseID", "course_id", "course_key", "course")),
         "app": _choose_field(fields, ("appID", "app_id", "application", "app")),
     }
-    _duckdb_field_cache[source_path] = inferred
+    _duckdb_field_cache[cache_key] = inferred
     return inferred
 
 
@@ -4371,6 +4389,24 @@ def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> di
 
 def _agent_dashboard_reasoning(question: str, activity: dict[str, Any]) -> dict[str, Any]:
     summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    # Aggregate dashboards must never retain row-level evidence. Provenance is
+    # represented by source paths and analytical-plan metadata instead.
+    summary.pop("sourceSamples", None)
+    summary.pop("source_samples", None)
+    activity.pop("sourceSamples", None)
+    activity.pop("source_samples", None)
+    for metadata in (activity.get("datasets") or {}).values():
+        if isinstance(metadata, dict):
+            metadata.pop("sourceSamples", None)
+            metadata.pop("source_samples", None)
+    if summary.get("isFullAggregate"):
+        activity["records"] = [
+            record
+            for slot in (activity.get("chartSlots") or [])
+            if isinstance(slot, dict)
+            for record in (slot.get("data") or [])
+            if isinstance(record, dict)
+        ]
     execution_source = str(summary.get("executionSource") or "").lower()
     if not execution_source:
         dataset_types = [
@@ -4381,7 +4417,7 @@ def _agent_dashboard_reasoning(question: str, activity: dict[str, Any]) -> dict[
         execution_source = "graph" if any("graph" in value for value in dataset_types) else "duckdb"
         summary["executionSource"] = execution_source
     if (
-        summary.get("reasoningSource") == "agent"
+        summary.get("reasoningSource") in {"agent", "cache"}
         and summary.get("reasoningExecutionSource") == execution_source
         and isinstance(activity.get("decisionTrace"), list)
         and activity["decisionTrace"]
@@ -4675,6 +4711,16 @@ def _llm_answer(question: str, results: list[dict[str, Any]]) -> str:
 THAI_TEXT_RE = re.compile(r"[\u0E00-\u0E7F]")
 THAI_SPLIT_INTENT_RE = re.compile(r"(?:แยก|แบ่ง|จำแนก|แจกแจง|จัดกลุ่ม)")
 THAI_ANALYTICS_FALLBACK = {
+    "เชื่อมตาราง": " join ",
+    "กรอง": " filter ",
+    "ตั้งแต่": " from ",
+    "เป็น": " = ",
+    "ตัด": " exclude ",
+    "ที่ว่าง": " empty ",
+    "จัดอันดับ": " rank top ",
+    "ด้วย": " by ",
+    "แยก series ตาม": " split by ",
+    "คืนเฉพาะข้อมูลรวม": " aggregate only ",
     "แสดง": " show ",
     "และ": " and ",
     "กับ": " with ",
@@ -4689,7 +4735,14 @@ THAI_ANALYTICS_FALLBACK = {
     "การกระจาย": " distribution ",
     "เปรียบเทียบ": " compare ",
     "แนวโน้ม": " trend ",
-    "แยกตาม": " by ",
+    "แยกตาม": " split by ",
+    "แยกกัน": " separate ",
+    "กราฟ": " chart ",
+    "หน่วยงาน": " department ",
+    "สถานะผู้เรียน": " learning status ",
+    "ลงทะเบียน": " enrollment ",
+    "นับคนไม่ซ้ำ": " distinct users ",
+    "ข้อมูลสรุป": " aggregate data ",
     "มากที่สุด": " most ",
     "เรียนจบ": " completed ",
     "กำลังเรียน": " in progress ",
@@ -4711,6 +4764,14 @@ THAI_ANALYTICS_FALLBACK = {
     "จำนวน": " number ",
 }
 THAI_PRESENTATION_FALLBACK = {
+    "Department": "\u0e41\u0e1c\u0e19\u0e01",
+    "Enrollment": "\u0e01\u0e32\u0e23\u0e25\u0e07\u0e17\u0e30\u0e40\u0e1a\u0e35\u0e22\u0e19",
+    "Enrolled At": "\u0e27\u0e31\u0e19\u0e17\u0e35\u0e48\u0e25\u0e07\u0e17\u0e30\u0e40\u0e1a\u0e35\u0e22\u0e19",
+    "grouped by": "\u0e08\u0e31\u0e14\u0e01\u0e25\u0e38\u0e48\u0e21\u0e15\u0e32\u0e21",
+    "filtered to": "\u0e01\u0e23\u0e2d\u0e07\u0e15\u0e32\u0e21",
+    "ranked by the requested measure": "\u0e08\u0e31\u0e14\u0e2d\u0e31\u0e19\u0e14\u0e31\u0e1a\u0e15\u0e32\u0e21\u0e15\u0e31\u0e27\u0e0a\u0e35\u0e49\u0e27\u0e31\u0e14\u0e17\u0e35\u0e48\u0e23\u0e30\u0e1a\u0e38",
+    "Shows": "\u0e41\u0e2a\u0e14\u0e07",
+    "Displays": "\u0e41\u0e2a\u0e14\u0e07",
     "Activity dashboard": "แดชบอร์ดกิจกรรม",
     "Dashboard generated from a validated multi-source analytical plan.": "แดชบอร์ดที่สร้างจากแผนวิเคราะห์ข้อมูลที่ผ่านการตรวจสอบ",
     "Users": "ผู้ใช้งาน",
@@ -4792,6 +4853,8 @@ CANONICAL_ANALYTICS_PHRASES = {
     "divided by": "split by",
     "classified by": "split by",
     "categorized by": "split by",
+    "broken down by": "split by",
+    "break down by": "split by",
     "enrollment status": "learning status",
     "study status": "learning status",
     "student status": "learning status",
@@ -4806,13 +4869,84 @@ def _contains_thai(text: str) -> bool:
     return bool(THAI_TEXT_RE.search(text))
 
 
+_MULTI_VIEW_COUNT_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+}
+_MULTI_VIEW_NOUNS = (
+    r"(?:chart|charts|view|views|visuali[sz]ation|visuali[sz]ations|analysis|analyses|กราฟ|แผนภูมิ)"
+)
+
+
+def _multi_view_request_contract(question: str) -> dict[str, Any] | None:
+    """Return an explicit multi-view contract without interpreting its clauses.
+
+    A single canonical analytics sentence cannot faithfully represent a request
+    such as "three charts: ranking; distribution; monthly trend".  This small
+    contract deliberately records only structural evidence that the request
+    contains multiple sibling views; field resolution remains the planner's
+    responsibility.
+    """
+    lowered = question.lower()
+    requested_count = 0
+    contract_match = re.search(r"\bchart[_ ]count\s*[=:]\s*(\d{1,2})\b", lowered)
+    if contract_match:
+        requested_count = int(contract_match.group(1))
+    numeric_match = re.search(rf"\b(\d{{1,2}})\s+{_MULTI_VIEW_NOUNS}\b", lowered)
+    if not numeric_match:
+        # Thai normally joins the following word directly after the chart noun,
+        # so an English-style trailing word boundary is not reliable here.
+        numeric_match = re.search(r"(\d{1,2})\s*(?:กราฟ|แผนภูมิ)", lowered)
+    if numeric_match and not requested_count:
+        requested_count = int(numeric_match.group(1))
+    else:
+        for word, count in _MULTI_VIEW_COUNT_WORDS.items():
+            if re.search(rf"\b{word}\s+{_MULTI_VIEW_NOUNS}\b", lowered):
+                requested_count = count
+                break
+
+    mentions_multi_view = bool(
+        requested_count >= 2
+        or re.search(rf"\b(?:multiple|several)\s+{_MULTI_VIEW_NOUNS}\b", lowered)
+        or re.search(rf"\b{_MULTI_VIEW_NOUNS}\s*[:\-]", lowered)
+    )
+    if not mentions_multi_view:
+        return None
+
+    # Semicolons and numbered list items are stable clause boundaries in both
+    # English and mixed-language requests.  Do not split on ordinary "and":
+    # it often joins dimensions within one chart.
+    clauses = [part.strip() for part in re.split(r"(?:;|\n|\b\d+[.)]\s*)", question) if part.strip()]
+    if requested_count < 2 and len(clauses) < 2:
+        return None
+    return {
+        "requestedCount": requested_count or len(clauses),
+        "clauses": clauses,
+    }
+
+
 def _canonicalize_question_for_processing(
     question: str,
     *,
     graph_path: Path | None = None,
     semantic_context: dict[str, Any] | None = None,
 ) -> str:
-    cache_key = f"analytics-v4:{question}" if semantic_context else question
+    # English analytics requests already contain the user's strongest source of
+    # truth. Normalizing their vocabulary is safe; asking a model to rewrite
+    # them can collapse multi-chart requests or turn date filters into trends.
+    if not _contains_thai(question) and _preserve_english_analytics_request(question):
+        return _normalize_canonical_analytics_question(question)
+    multi_view_contract = _multi_view_request_contract(question)
+    # Preserve the original sibling clauses before model-based semantic
+    # canonicalization.  The latter returns one canonical query by design and
+    # would otherwise collapse a multi-view dashboard into one chart.
+    if multi_view_contract:
+        preserved = _fallback_english_question(question) if _contains_thai(question) else question
+        return _normalize_canonical_analytics_question(preserved)
+    cache_key = f"analytics-v5:{question}" if semantic_context else question
     cached = _question_language_cache.get(cache_key)
     if cached:
         return cached
@@ -4825,7 +4959,16 @@ def _canonicalize_question_for_processing(
             _question_language_cache[cache_key] = persisted
             write_question_translation(graph_path, persisted_key, persisted)
             return persisted
-    parsed = _invoke_language_json(
+    # Mixed-language schema requests already carry exact identifiers. A
+    # deterministic lexical normalization preserves those identifiers, dates,
+    # limits, and clause order more faithfully than asking a model to rewrite
+    # the whole request into a single sentence.
+    deterministic = (
+        _fallback_english_question(question)
+        if _contains_thai(question) and len(re.findall(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b", question.lower())) >= 2
+        else ""
+    )
+    parsed = None if deterministic else _invoke_language_json(
         system=(
             "Interpret the user's analytics request and rewrite it as one precise English canonical analytics query. "
             "Equivalent precise, conversational, paraphrased, and Thai requests must produce the same canonical query. "
@@ -4843,7 +4986,7 @@ def _canonicalize_question_for_processing(
         ),
         payload={"question": question, **(semantic_context or {})},
     )
-    english = (
+    english = deterministic or (
         str(parsed.get("canonicalQuestion") or parsed.get("englishQuestion") or "").strip()
         if isinstance(parsed, dict)
         else ""
@@ -4865,6 +5008,23 @@ def _canonicalize_question_for_processing(
     if len(_question_language_cache) > 200:
         _question_language_cache.pop(next(iter(_question_language_cache)))
     return english
+
+
+def _preserve_english_analytics_request(question: str) -> bool:
+    lowered = question.lower()
+    signals = sum(
+        bool(re.search(pattern, lowered))
+        for pattern in (
+            r"\b(?:distinct|unique)\b",
+            r"\b(?:top|rank|ranking|highest|most)\b",
+            r"\b(?:split|breakdown|break\s+.+\s+down|series)\b",
+            r"\b(?:monthly|daily|weekly|yearly|trend|over time)\b",
+            r"\b(?:chart|visual|dashboard|distribution|composition)\b",
+            r"\b\d{4}(?:-\d{2}(?:-\d{2})?)?\b",
+            r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b",
+        )
+    )
+    return signals >= 2
 
 
 def _canonical_question_from_semantic_plan(
@@ -5020,7 +5180,6 @@ def _semantic_time_intent(question: str) -> bool:
             "change",
             "changed",
             "daily",
-            "date",
             "day",
             "monthly",
             "month",
@@ -5031,7 +5190,6 @@ def _semantic_time_intent(question: str) -> bool:
             "trend",
             "week",
             "weekly",
-            "year",
             "yearly",
         }
     )
@@ -5106,10 +5264,26 @@ def _duckdb_semantic_schema(store: Any) -> list[dict[str, Any]]:
 
 def _normalize_canonical_analytics_question(question: str) -> str:
     result = question.strip()
+    result = re.sub(
+        r"\bbreak\s+(?:each|every)\s+[^,.;]{0,60}?\s+down\s+by\b",
+        "split by",
+        result,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r"\bbreak\s+(?:each|every)\s+[^,.;]{0,60}?\s+into\s+"
+        r"(?:passed|pass)\s+versus\s+not\s+passed\b",
+        "split by course_pass",
+        result,
+        flags=re.IGNORECASE,
+    )
     for source, target in sorted(CANONICAL_ANALYTICS_PHRASES.items(), key=lambda item: -len(item[0])):
         result = re.sub(rf"\b{re.escape(source)}\b", target, result, flags=re.IGNORECASE)
     result = re.sub(r"\bper\b", "by", result, flags=re.IGNORECASE)
     result = re.sub(r"\bfor each\b", "by", result, flags=re.IGNORECASE)
+    result = re.sub(r"\bsplit\s+into\b", "split by", result, flags=re.IGNORECASE)
+    result = re.sub(r"\b(?:broken|break)\s+down\s+by\b", "split by", result, flags=re.IGNORECASE)
+    result = re.sub(r"\b(?:passed|pass)\s+versus\s+not\s+passed\b", "split by course_pass", result, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", result).strip()
 
 
@@ -5194,19 +5368,8 @@ def _localize_activity_to_thai(question: str, activity: dict[str, Any]) -> dict[
                 if isinstance(translated, str) and _contains_thai(translated):
                     existing[metric_id] = translated.strip()[:100]
             summary["metricLabels"] = existing
-        value_labels = parsed.get("valueLabels") if isinstance(parsed.get("valueLabels"), dict) else {}
-        if value_labels:
-            for slot in slots:
-                if not isinstance(slot, dict):
-                    continue
-                for datum in slot.get("data") or []:
-                    if not isinstance(datum, dict):
-                        continue
-                    for key in ("label", "series"):
-                        original = datum.get(key)
-                        translated = value_labels.get(str(original))
-                        if isinstance(translated, str) and _contains_thai(translated):
-                            datum[key] = translated.strip()[:100]
+        # Data labels are contract keys used by factual validators and clients.
+        # Keep them locale-neutral; localize chart titles and explanatory text.
         localized_trace = parsed.get("reasoning") if isinstance(parsed.get("reasoning"), list) else []
         for localized in localized_trace:
             if not isinstance(localized, dict) or not isinstance(localized.get("index"), int):
@@ -5293,11 +5456,6 @@ def _fallback_localize_activity(activity: dict[str, Any]) -> None:
             slot["title"] = localize(slot.get("title"))
             if slot.get("title") and not _contains_thai(str(slot["title"])):
                 slot["title"] = "กราฟข้อมูล"
-            for datum in slot.get("data") or []:
-                if not isinstance(datum, dict):
-                    continue
-                for key in ("label", "series"):
-                    datum[key] = localize(datum.get(key))
     summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
     labels = summary.get("metricLabels") if isinstance(summary.get("metricLabels"), dict) else {}
     summary["metricLabels"] = {
@@ -5460,7 +5618,55 @@ def _mark_hybrid_execution(activity: dict[str, Any], graph_hints: dict[str, Any]
     return activity
 
 
+_PATTERN_COMPILER_EPOCH = "pattern-compiler-v1"
+
+
+def _text_only_answer(store: Any, question: str) -> str:
+    """Deterministic text-only answer for explicit no-chart requests."""
+
+    database_path = _duckdb_database_path(store)
+    total: int | None = None
+    if database_path and Path(database_path).exists():
+        try:
+            from dashboard_agent.readonly_duckdb import connect_read_only
+
+            con = connect_read_only(str(database_path))
+            try:
+                row = con.execute(f"SELECT COUNT(DISTINCT user_id) FROM {FACT_TABLE}").fetchone()
+                total = int(row[0]) if row and row[0] is not None else None
+            finally:
+                con.close()
+        except Exception:
+            total = None
+    if total is None:
+        return "The distinct-user count is unavailable right now. Please try again later."
+    return (
+        f"{total:,} distinct users are represented in the warehouse. "
+        "Text-only response requested, so no chart was created."
+    )
+
+
+def _dashboard_source_version(database_path: Path | None) -> str:
+    if database_path is None:
+        return _PATTERN_COMPILER_EPOCH
+    try:
+        stat = database_path.stat()
+    except OSError:
+        return _PATTERN_COMPILER_EPOCH
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{_PATTERN_COMPILER_EPOCH}"
+
+
 def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
+    try:
+        return _run_agent_impl(state)
+    except Exception:
+        import traceback
+        with open('/tmp/runagent-errors.log', 'a', encoding='utf-8') as _err:
+            _err.write(traceback.format_exc() + '\n===\n')
+        raise
+
+
+def _run_agent_impl(state: AgentState) -> dict[str, list[AIMessage]]:
     user_question = _last_question(state)
     store = get_store()
     seed_question = _seed_question_for_semantic_search(user_question)
@@ -5507,25 +5713,56 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
     cache_results = _aggregate_cache_results(store, question)
     graph_results = store.search(question, limit=24)
     results = cache_results + graph_results
+    if wants_text_only(user_question):
+        answer = _text_only_answer(store, user_question)
+        if notices:
+            answer = "\n\n".join(notices + [answer])
+        return {"messages": [AIMessage(content=answer)]}
+
     if _wants_dashboard(question):
         database_path = _duckdb_database_path(store)
+        source_version = _dashboard_source_version(database_path)
         graph_hints = _graph_planning_hints(store, graph_results)
-        activity: dict[str, Any] = {}
-        generated = False
-        if database_path and database_path.exists():
-            activity = (
-                build_complex_dashboard(database_path, question, graph_hints=graph_hints)
-                or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
-                or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
-                or _duckdb_activity_context(store, question)
+        activity = read_graph_dashboard_cache(
+            store.path,
+            question,
+            source_version=source_version,
+        )
+        requested_pattern = detect_pattern(user_question)
+        # Deterministically compiled patterns bypass the exact-match dashboard
+        # cache entirely: the compiler is a pure function of question and data,
+        # so the cache adds no value and LLM-canonicalized keys could
+        # cross-contaminate lookalike requests. Cache reads/writes key on the
+        # RAW user question so repeated identical prompts stay deterministic;
+        # canonicalized rewrites are unstable cache keys.
+        activity = (
+            None
+            if requested_pattern is not None
+            else read_graph_dashboard_cache(
+                store.path,
+                user_question,
+                source_version=source_version,
             )
-            if activity:
-                activity = _mark_hybrid_execution(activity, graph_hints)
-                generated = True
+        )
+        generated = False
+        deterministic_pattern = False
+        if activity is None and database_path and database_path.exists():
+            if requested_pattern is not None:
+                activity = compile_analytical_pattern(str(database_path), user_question)
+                deterministic_pattern = activity is not None
+            if not deterministic_pattern:
+                activity = (
+                    build_complex_dashboard(database_path, question, graph_hints=graph_hints)
+                    or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
+                    or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
+                    or _duckdb_activity_context(store, question)
+                )
+                if activity:
+                    activity = _mark_hybrid_execution(activity, graph_hints)
+                    generated = True
         if not activity:
             activity = (
-                read_graph_dashboard_cache(store.path, question)
-                or _graph_time_series_activity_context(store, question)
+                _graph_time_series_activity_context(store, question)
                 or _graph_ranked_dimension_context(store, question)
                 or _aggregate_cache_activity(store, question)
                 or _activity_dashboard_context(store, results, question)
@@ -5534,10 +5771,22 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
             if generated:
                 activity = _llm_design_complex_dashboard(question, activity)
             activity = _agent_dashboard_reasoning(question, activity)
-            write_graph_dashboard_cache(store.path, question, activity)
+            if not deterministic_pattern:
+                write_graph_dashboard_cache(
+                    store.path,
+                    user_question,
+                    activity,
+                    source_version=source_version,
+                )
             activity = _localize_activity_to_thai(user_question, activity)
         title = "แดชบอร์ดข้อมูล" if _contains_thai(user_question) else ("Activity dashboard" if activity else "Dashboard graph")
-        answer = graph_dashboard_marker(status=store.status(), results=results, activity=activity, title=title)
+        marker_results = [] if activity else results
+        answer = graph_dashboard_marker(
+            status=store.status(),
+            results=marker_results,
+            activity=activity,
+            title=title,
+        )
     else:
         answer = _llm_answer(user_question, results)
     if notices:

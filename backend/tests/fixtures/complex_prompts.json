@@ -1,0 +1,264 @@
+{
+ "secondary_users_by_department_status": {
+  "pattern": "secondary_department_status_top8",
+  "contract": {
+   "allowed_types": [
+    "stacked_bar",
+    "grouped_bar",
+    "bar",
+    "horizontal_bar"
+   ],
+   "max_points": 30,
+   "sources": [
+    "dashboard_agent_user_course_fact",
+    "dashboard_agent_user_dim"
+   ]
+  },
+  "canonical_prompt": "Build a dashboard for learners whose education level is secondary and who enrolled on or after 1 January 2025. Compare the top 8 non-empty course departments by distinct enrolled users, split each department by learning status. Use the enrollment fact joined to the user dimension, not activity logs, and do not expose personal records.",
+  "variants": {
+   "concise": {
+    "locale": "en",
+    "prompt": "Show the top 8 populated course departments by distinct secondary-level learners enrolled since 2025-01-01, stacked by learning status. Use enrollment and user data only; aggregates only."
+   },
+   "conversational": {
+    "locale": "en",
+    "prompt": "Can you compare which eight course departments have the most unique secondary-education learners who enrolled from January 1, 2025 onward, and break every bar down by learning status? Please avoid activity logs and personal details."
+   },
+   "explicit_schema": {
+    "locale": "en",
+    "prompt": "Join dashboard_agent_user_course_fact to dashboard_agent_user_dim, filter level_of_education to secondary and enroll_date >= 2025-01-01, exclude blank department_name, rank the top 8 by distinct user count, and split by learning_status in an aggregate dashboard."
+   },
+   "reordered": {
+    "locale": "en",
+    "prompt": "Return aggregate data only. Split by learning status, rank nonblank course departments by distinct enrolled users, keep the top eight, then restrict the population to secondary education and enrollments on or after 1 January 2025. Do not use activity events."
+   },
+   "chart_request": {
+    "locale": "en",
+    "prompt": "Make a stacked horizontal bar chart of the top 8 non-empty departments for secondary learners enrolled since the start of 2025. Measure unique enrolled users and use learning status as the series; no PII."
+   },
+   "negation": {
+    "locale": "th",
+    "prompt": "ห้ามนับ activity records และห้ามแสดงข้อมูลผู้เรียนรายคน ให้นับ distinct users จากข้อมูลลงทะเบียนที่เชื่อมกับระดับการศึกษา กรองผู้เรียนมัธยมที่ลงทะเบียนตั้งแต่ 2025-01-01 แล้วแสดง 8 หน่วยงานที่มีชื่อและมียอดสูงสุด แยกตามสถานะการเรียน"
+   },
+   "typo_tolerant": {
+    "locale": "th",
+    "prompt": "ทำแดชบอดผู้เรียนมัธยมที่ลงทะเบียตั้งแต่ 1 ม.ค. 2025 เอา 8 หน่วยงานหลักสูตที่ไม่ว่าง เรียงตามผู้ใช้ไม่ซ้ำ และแยกสถานะการเรียน ใช้ข้อมูลสรุปเท่านั้นไม่ใช้ activity log"
+   },
+   "analyst": {
+    "locale": "en",
+    "prompt": "Population = secondary education; cohort entry = enroll_date >= 2025-01-01; metric = count distinct enrolled user; dimension = non-null department_name; rank limit = 8; series = learning_status. Produce a privacy-safe dashboard from enrollment plus user dimensions."
+   },
+   "thai_formal": {
+    "locale": "th",
+    "prompt": "สร้างแดชบอร์ดผู้เรียนระดับมัธยมศึกษาที่ลงทะเบียนตั้งแต่วันที่ 1 มกราคม 2025 เป็นต้นไป เปรียบเทียบ 8 หน่วยงานหลักสูตรที่ไม่ว่างและมีจำนวนผู้ใช้ไม่ซ้ำสูงสุด แยกตามสถานะการเรียน ใช้ข้อมูลการลงทะเบียนร่วมกับข้อมูลผู้ใช้เท่านั้น และแสดงเฉพาะข้อมูลสรุป"
+   },
+   "thai_conversational": {
+    "locale": "th",
+    "prompt": "ช่วยทำกราฟให้หน่อยว่า 8 หน่วยงานหลักสูตรไหนมีผู้เรียนระดับมัธยมที่ลงทะเบียนหลังปีใหม่ 2025 มากที่สุด โดยนับผู้เรียนไม่ซ้ำและแบ่งสีตามสถานะการเรียน ไม่ใช้ activity log และไม่แสดงข้อมูลส่วนบุคคล"
+   },
+   "thai_schema": {
+    "locale": "th",
+    "prompt": "เชื่อมตาราง enrollment fact กับ user dimension กรอง level_of_education เป็น secondary และ enroll_date ตั้งแต่ 2025-01-01 ตัด department_name ที่ว่าง จัดอันดับ 8 อันดับด้วย distinct users และแยก series ตาม learning_status โดยคืนเฉพาะข้อมูลรวม"
+   },
+   "privacy_first": {
+    "locale": "th",
+    "prompt": "โดยไม่ส่งคืนชื่อ username อีเมล หรือข้อมูลระดับรายบุคคล ให้สร้างแดชบอร์ดสรุป 8 หน่วยงานหลักสูตรที่ไม่ว่างและมีผู้ลงทะเบียนระดับมัธยมแบบไม่ซ้ำสูงสุดตั้งแต่ 1 มกราคม 2025 แยกตามสถานะการเรียน โดยใช้ enrollment fact และ user dimension"
+   }
+  }
+ },
+ "nectec_monthly_enrollment_status": {
+  "pattern": "nectec_monthly_status_trend",
+  "contract": {
+   "allowed_types": [
+    "line",
+    "multi_line",
+    "area",
+    "grouped_bar",
+    "stacked_bar"
+   ],
+   "max_points": 60,
+   "sources": [
+    "dashboard_agent_user_course_fact"
+   ]
+  },
+  "canonical_prompt": "Create a monthly trend dashboard from January 2025 through June 2026 for NECTEC courses. For every month, show distinct enrolled users split into passed, in_progress, and inactive learning status. Use enroll_date rather than activity dates, keep all three series separate, and do not include names, usernames, or emails.",
+  "variants": {
+   "concise": {
+    "locale": "en",
+    "prompt": "Chart monthly distinct NECTEC enrolled users from Jan 2025 to Jun 2026, with separate passed, in_progress, and inactive series based on enroll_date. Aggregates only."
+   },
+   "conversational": {
+    "locale": "en",
+    "prompt": "How did unique enrollment in NECTEC courses change each month between January 2025 and June 2026? Show passed, in progress, and inactive separately, use the enrollment date, and hide all personal information."
+   },
+   "explicit_schema": {
+    "locale": "en",
+    "prompt": "Filter dashboard_agent_user_course_fact to NECTEC courses and enroll_date from 2025-01-01 through 2026-06-30. Group distinct users by calendar month and learning_status, preserving passed, in_progress, and inactive as three series."
+   },
+   "reordered": {
+    "locale": "en",
+    "prompt": "Keep three status lines separate and expose no names, usernames, or emails. For NECTEC only, count distinct enrolled users monthly from January 2025 through June 2026 using enroll_date rather than event timestamps."
+   },
+   "line_chart": {
+    "locale": "en",
+    "prompt": "Build a multi-line chart for NECTEC monthly enrollment, Jan 2025–Jun 2026. The y-axis is distinct users; the x-axis comes from enroll_date month; the lines are passed, in_progress, and inactive."
+   },
+   "not_activity": {
+    "locale": "th",
+    "prompt": "ห้ามใช้ activity month หรือ event_date ให้ใช้วันที่ลงทะเบียนแสดงแนวโน้มรายเดือนของผู้ใช้ไม่ซ้ำในหลักสูตร NECTEC ตั้งแต่ 2025-01 ถึง 2026-06 แยกเป็นสามสถานะการเรียนและแสดงข้อมูลรวมอย่างปลอดภัย"
+   },
+   "typo_tolerant": {
+    "locale": "th",
+    "prompt": "ทำกราฟแนวโน้มรายเดือของการลงทะเบีย NECTEC ตั้งแต่ม.ค. 2025 ถึงมิ.ย. 2026 นับผู้ใช้ไม่ซ้ำ แยก passed, in_progres, inactive ใช้ enrol_date ไม่ใช่วันที่ activity และไม่เอา PII"
+   },
+   "analyst": {
+    "locale": "en",
+    "prompt": "Scope = NECTEC; period = 2025-01-01..2026-06-30 inclusive; grain = enroll month; measure = count distinct user; series = learning_status {passed,in_progress,inactive}; source date = enroll_date. Render a privacy-safe trend dashboard."
+   },
+   "thai_formal": {
+    "locale": "th",
+    "prompt": "สร้างแดชบอร์ดแนวโน้มรายเดือนของหลักสูตร NECTEC ตั้งแต่เดือนมกราคม 2025 ถึงมิถุนายน 2026 แสดงจำนวนผู้ลงทะเบียนไม่ซ้ำ แยกเป็นสถานะ passed, in_progress และ inactive โดยใช้ enroll_date และไม่แสดงชื่อ ชื่อผู้ใช้ หรืออีเมล"
+   },
+   "thai_conversational": {
+    "locale": "th",
+    "prompt": "อยากดูว่าจำนวนผู้เรียนไม่ซ้ำของหลักสูตร NECTEC เปลี่ยนไปอย่างไรในแต่ละเดือนตั้งแต่ม.ค. 2025 ถึงมิ.ย. 2026 ช่วยแยกเส้นเป็นเรียนผ่าน กำลังเรียน และไม่ใช้งาน ใช้วันที่ลงทะเบียนไม่ใช่วันที่ทำกิจกรรม"
+   },
+   "thai_schema": {
+    "locale": "th",
+    "prompt": "กรอง enrollment fact เฉพาะ NECTEC และ enroll_date ระหว่าง 2025-01-01 ถึง 2026-06-30 จากนั้น group by เดือนและ learning_status พร้อมนับ distinct users โดยคง 3 series คือ passed, in_progress, inactive และคืนเฉพาะข้อมูลรวม"
+   },
+   "privacy_first": {
+    "locale": "th",
+    "prompt": "โดยไม่ใส่ตัวระบุผู้เรียนในผลลัพธ์ ให้คืนแดชบอร์ดสรุปรายเดือนของผู้ใช้หลักสูตร NECTEC แบบไม่ซ้ำที่ลงทะเบียนระหว่างมกราคม 2025 ถึงมิถุนายน 2026 สร้างเดือนจาก enroll_date และคง passed, in_progress, inactive เป็นคนละ series"
+   }
+  }
+ },
+ "certified_users_by_province_pass_status": {
+  "pattern": "certified_province_pass_status_top10",
+  "contract": {
+   "allowed_types": [
+    "stacked_bar",
+    "grouped_bar",
+    "bar",
+    "horizontal_bar"
+   ],
+   "max_points": 24,
+   "sources": [
+    "dashboard_agent_user_course_fact"
+   ]
+  },
+  "canonical_prompt": "Among enrollments since 1 January 2025 that have a certificate, compare the top 10 non-empty school provinces by distinct users and split each province by course pass status. Rank provinces by the total distinct certified users, label the two series passed and not_passed, and return aggregate data only.",
+  "variants": {
+   "concise": {
+    "locale": "en",
+    "prompt": "Show the top 10 nonblank school provinces by distinct certified users enrolled since 2025-01-01, split into passed and not_passed. Aggregate only."
+   },
+   "conversational": {
+    "locale": "en",
+    "prompt": "Which ten school provinces have the most unique learners with certificates among enrollments from January 1, 2025 onward? Break each province into passed versus not passed and do not show individual records."
+   },
+   "explicit_schema": {
+    "locale": "en",
+    "prompt": "From dashboard_agent_user_course_fact, filter enroll_date >= 2025-01-01 and has_certificate = true, exclude empty school_province, group distinct users by province and course_pass, then rank the top 10 provinces by their total certified users."
+   },
+   "reordered": {
+    "locale": "en",
+    "prompt": "Return only aggregate counts with passed and not_passed as two series. Rank the top ten populated school provinces by total distinct users after restricting to certificate-bearing enrollments since 1 Jan 2025."
+   },
+   "chart_request": {
+    "locale": "th",
+    "prompt": "สร้าง grouped หรือ stacked bar chart สำหรับ 10 จังหวัดของสถานศึกษาที่ไม่ว่างและมีอันดับสูงสุด วัดจำนวนผู้ได้รับใบประกาศแบบไม่ซ้ำที่ลงทะเบียนตั้งแต่ปี 2025 และแบ่งสีตามสถานะหลักสูตร passed กับ not_passed"
+   },
+   "negation": {
+    "locale": "th",
+    "prompt": "ตัดการลงทะเบียนก่อนปี 2025 แถวที่ไม่มีใบประกาศ จังหวัดว่าง และข้อมูลส่วนบุคคลทั้งหมด จากข้อมูลที่เหลือให้จัดอันดับ 10 จังหวัดตามผู้ใช้ไม่ซ้ำ และแยกยอดเป็น passed กับ not_passed"
+   },
+   "typo_tolerant": {
+    "locale": "th",
+    "prompt": "เทียบ 10 จังหวัดโรงเรียที่ไม่ว่างของคนมีใบประกาดที่ลงทะเบียตั้งแต่ 1 ม.ค. 2025 นับผู้ใช้ไม่ซ้ำ แยกสถานะผ่านเป็น passed และ not_passed ห้ามมีข้อมูลรายคน"
+   },
+   "analyst": {
+    "locale": "en",
+    "prompt": "Cohort = enroll_date >= 2025-01-01 AND certificate present; dimension = school_province excluding null/blank; metric = distinct users; rank = top 10 on total; series = binary course_pass. Produce aggregate visualization only."
+   },
+   "thai_formal": {
+    "locale": "th",
+    "prompt": "สำหรับการลงทะเบียนตั้งแต่วันที่ 1 มกราคม 2025 ที่มีใบประกาศนียบัตร ให้เปรียบเทียบ 10 จังหวัดของสถานศึกษาที่ไม่ว่างและมีจำนวนผู้ใช้ไม่ซ้ำสูงสุด แยกตามสถานะผ่านและไม่ผ่านหลักสูตร จัดอันดับจากยอดรวม และแสดงเฉพาะข้อมูลสรุป"
+   },
+   "thai_conversational": {
+    "locale": "th",
+    "prompt": "จังหวัดของโรงเรียน 10 อันดับไหนมีผู้เรียนที่ได้รับใบประกาศและลงทะเบียนตั้งแต่ต้นปี 2025 มากที่สุด ช่วยนับคนไม่ซ้ำ แยกเป็นผ่านกับไม่ผ่าน และอย่าแสดงข้อมูลรายบุคคล"
+   },
+   "thai_schema": {
+    "locale": "th",
+    "prompt": "กรอง enrollment fact ด้วย enroll_date >= 2025-01-01 และ has_certificate=true ตัด school_province ที่ว่าง นับ distinct users แยกตาม course_pass แล้วเลือก 10 จังหวัดแรกจากยอดรวม โดยคืน aggregate data เท่านั้น"
+   }
+  }
+ },
+ "explicit_three_chart_dashboard": {
+  "pattern": "three_chart_enrollment_overview",
+  "contract": {
+   "allowed_types": [
+    "line",
+    "multi_line",
+    "stacked_bar",
+    "grouped_bar",
+    "bar",
+    "horizontal_bar",
+    "donut"
+   ],
+   "max_points": 50,
+   "min_charts": 3,
+   "sources": [
+    "dashboard_agent_user_course_fact"
+   ]
+  },
+  "canonical_prompt": "Build one dashboard with exactly three separate charts for enrollments since 1 January 2025: first, the top 8 non-empty course departments by distinct users split by learning status; second, the overall distribution of distinct users by learning status; third, the monthly trend of distinct enrolled users from January 2025 through June 2026. Return all three charts and aggregate data only.",
+  "variants": {
+   "concise": {
+    "locale": "en",
+    "prompt": "Make exactly 3 charts for enrollments since 2025-01-01: top 8 nonblank departments by distinct users/status, overall distinct-user status distribution, and monthly distinct enrollment through Jun 2026. Aggregates only."
+   },
+   "numbered": {
+    "locale": "en",
+    "prompt": "Build one dashboard containing exactly three visuals. 1) Top eight named course departments by unique enrolled users, split by learning status. 2) Overall unique-user distribution by learning status. 3) Monthly unique enrollments from Jan 2025 to Jun 2026. Use enrollments since Jan 1 2025 and no personal rows."
+   },
+   "conversational": {
+    "locale": "th",
+    "prompt": "ช่วยใส่กราฟแยกกัน 3 กราฟในแดชบอร์ดเดียวได้ไหม ได้แก่ 8 หน่วยงานนำแยกตามสถานะผู้เรียน สัดส่วนสถานะรวม และแนวโน้มลงทะเบียนรายเดือนถึงมิถุนายน 2026 เริ่มกลุ่มตั้งแต่ 1 มกราคม 2025 นับคนไม่ซ้ำและใช้ข้อมูลสรุป"
+   },
+   "reordered": {
+    "locale": "th",
+    "prompt": "สำหรับกลุ่มลงทะเบียนมกราคม 2025 ถึงมิถุนายน 2026 ให้แสดงแนวโน้มผู้ใช้ไม่ซ้ำรายเดือนก่อน ตามด้วยการกระจายสถานะการเรียนรวม และ 8 หน่วยงานที่ไม่ว่างพร้อมการแยกสถานะ ส่งมอบกราฟ exactly 3 กราฟในแดชบอร์ดที่ปลอดภัยต่อข้อมูลส่วนบุคคล"
+   },
+   "explicit_visuals": {
+    "locale": "en",
+    "prompt": "Return exactly three independent chart slots: a stacked bar for top-8 department_name by distinct users and learning_status, a donut for overall distinct users by learning_status, and a line chart by enroll_date month through 2026-06. Filter enroll_date >= 2025-01-01."
+   },
+   "strong_delivery": {
+    "locale": "th",
+    "prompt": "ห้ามรวมผลลัพธ์เป็นกราฟเดียวและห้ามขาดกราฟใดกราฟหนึ่ง ให้สร้าง exactly 3 กราฟสำหรับการลงทะเบียนหลังปี 2024 ได้แก่ อันดับหน่วยงานแยก series สถานะ สัดส่วนสถานะรวม และการลงทะเบียนไม่ซ้ำรายเดือนถึงมิถุนายน 2026 โดยไม่มี PII"
+   },
+   "typo_tolerant": {
+    "locale": "th",
+    "prompt": "ทำแดชบอด exacly 3 กราฟแยกกันของการลงทะเบียตั้งแต่ 1 ม.ค. 2025: 8 หน่วยงานไม่ว่างตามผู้ใช้ไม่ซ้ำ/สถานะ, การกระจายสถานะรวม, และแนวโน้มผู้ลงทะเบียนไม่ซ้ำรายเดือถึงมิ.ย. 2026 ใช้ข้อมูลรวมเท่านั้น"
+   },
+   "analyst": {
+    "locale": "en",
+    "prompt": "Dashboard contract: chart_count=3; cohort enroll_date>=2025-01-01; chart A top_n=8 dimension department_name measure distinct_user series learning_status; chart B dimension learning_status measure distinct_user; chart C month(enroll_date) through 2026-06 measure distinct_user. No row-level output."
+   },
+   "thai_formal": {
+    "locale": "th",
+    "prompt": "สร้างแดชบอร์ดเดียวที่มีกราฟแยกกัน exactly 3 กราฟ สำหรับการลงทะเบียนตั้งแต่ 1 มกราคม 2025 ได้แก่ 8 หน่วยงานหลักสูตรที่ไม่ว่างและมีผู้ใช้ไม่ซ้ำสูงสุดแยกตามสถานะ การกระจายผู้ใช้ไม่ซ้ำตามสถานะโดยรวม และแนวโน้มผู้ลงทะเบียนไม่ซ้ำรายเดือนถึงมิถุนายน 2026 โดยแสดงเฉพาะข้อมูลรวม"
+   },
+   "thai_conversational": {
+    "locale": "th",
+    "prompt": "ขอแดชบอร์ด 3 กราฟแยกกันนะ กราฟแรกเป็น 8 หน่วยงานที่มีผู้เรียนไม่ซ้ำมากสุดแยกสถานะ กราฟสองเป็นสัดส่วนสถานะรวม และกราฟสามเป็นแนวโน้มการลงทะเบียนรายเดือนถึงมิ.ย. 2026 ใช้ข้อมูลตั้งแต่ต้นปี 2025 และไม่เอาข้อมูลส่วนบุคคล"
+   },
+   "thai_schema": {
+    "locale": "th",
+    "prompt": "กำหนด chart_count=3 และกรอง enroll_date>=2025-01-01 โดย chart A จัดอันดับ department_name 8 อันดับด้วย distinct users แยก learning_status, chart B แสดง distribution ตาม learning_status, chart C แสดง distinct users รายเดือนถึง 2026-06 คืนเฉพาะ aggregate data"
+   }
+  }
+ }
+}

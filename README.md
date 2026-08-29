@@ -41,6 +41,55 @@ npm run dev
 
 Open `http://localhost:3000`. Ask the agent to `refresh S3 data`, query a field or value, or `show dashboard graph`.
 
+## Hourly lead ETL pipeline
+
+The production warehouse is populated from `s3://lead-etl` by selecting the
+newest Parquet snapshot for every discovered dataset. Dataset names and schemas
+come from the S3 paths and Parquet files; the loader does not keep a hardcoded
+table list. Each dataset is published as a typed `lead_etl_*` DuckDB table and
+also appears in the generic `unified_records` contract used by the Agent.
+
+The first successful run preserves an existing unmanaged warehouse as a
+timestamped `.legacy-*.bak` file. Later runs compare S3 key, ETag, and size with
+`lead_etl_object_manifest`, replace only changed datasets in a temporary
+database, and atomically publish the completed warehouse. A failed download or
+Parquet read leaves the prior warehouse in place. The graph search index is
+then rebuilt from the same warehouse snapshot.
+
+Historical partitions can be backfilled once with the same schema contract:
+
+```bash
+.venv/bin/python run_s3_duckdb_pipeline.py --backfill-history
+```
+
+The backfill detects the source behavior from consecutive-file overlap. Full
+snapshots continue to replace their current `lead_etl_*` table. Incremental
+datasets are reconstructed across all partitions using inferred, validated
+business keys, and future hourly deltas merge on those same keys. Exact row
+versions are retained separately in `lead_etl_history_*` tables and the generic
+`lead_etl_history_records` table. Object-level provenance is recorded in
+`lead_etl_history_objects`; current analytical queries continue to use
+`unified_records`, so historical versions do not double-count current metrics.
+
+```bash
+cd /home/thacha/dashboard_agent/backend
+.venv/bin/python run_s3_duckdb_pipeline.py --s3-uri s3://lead-etl
+```
+
+Install the user timer to run at minute 25 of every hour, after the observed
+Open edX, Bookroll, and Simulator exports have landed:
+
+```bash
+cd /home/thacha/dashboard_agent
+./deploy/install-ingest-timer.sh --enable
+systemctl --user list-timers dashboard-agent-ingest.timer
+journalctl --user -u dashboard-agent-ingest.service -n 100 --no-pager
+```
+
+Set `S3_DATA_URI`, `DUCKDB_PATH`, `AWS_REGION`, and `GRAPH_PATH` in
+`backend/.env` when deployment paths differ. AWS credentials continue to use
+the normal boto3 provider chain.
+
 ## Data Model
 
 Each S3 object becomes a `dataset` node. JSON objects become `field` nodes, arrays become ordered `record` nodes, and scalar values are stored on the owning field or record nodes. `has_field` and `has_item` edges preserve the original hierarchy.

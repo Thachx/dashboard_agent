@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Dashboard Agent S3 ingestion after hourly ETL snapshots arrive
+
+[Timer]
+OnCalendar=*-*-* *:25:00
+Persistent=true
+RandomizedDelaySec=2min
+AccuracySec=1min
+Unit=dashboard-agent-ingest.service
+
+[Install]
+WantedBy=timers.target

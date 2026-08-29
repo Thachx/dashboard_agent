@@ -3,7 +3,19 @@ import json
 import pytest
 
 from dashboard_agent import agent
-from dashboard_agent.dashboard_planner import _catalog, plan_complex_dashboard
+from dashboard_agent.dashboard_planner import (
+    AnalyticalPlan,
+    ColumnProfile,
+    FilterSpec,
+    TableProfile,
+    _apply_plan_presentation_to_slots,
+    _catalog,
+    _measure_query_terms,
+    _plan_presentation_spec,
+    _requested_top_limit,
+    _resolve_measure,
+    plan_complex_dashboard,
+)
 from dashboard_agent.graph_dashboard_cache import (
     read_graph_dashboard_cache,
     read_question_translation,
@@ -15,6 +27,96 @@ from dashboard_agent.graph_dashboard_cache import (
 class FakeStore:
     def __init__(self, path):
         self.path = path
+
+
+def test_plan_presentation_uses_plan_fields_and_never_filter_values():
+    user_id = ColumnProfile(
+        table="enrollment_fact",
+        name="user_id",
+        data_type="INTEGER",
+        terms=frozenset({"user", "id"}),
+        is_identifier=True,
+        is_time=False,
+    )
+    department = ColumnProfile(
+        table="enrollment_fact",
+        name="department_name",
+        data_type="VARCHAR",
+        terms=frozenset({"department", "name"}),
+        is_identifier=False,
+        is_time=False,
+    )
+    status = ColumnProfile(
+        table="enrollment_fact",
+        name="learning_status",
+        data_type="VARCHAR",
+        terms=frozenset({"learning", "status"}),
+        is_identifier=False,
+        is_time=False,
+    )
+    plan = AnalyticalPlan(
+        intent="ranked_comparison",
+        base_table="enrollment_fact",
+        measure=user_id,
+        dimensions=[department, status],
+        time_dimension=None,
+        joins=[],
+        requested_terms=["top", "department", "users", "split", "learning", "status"],
+    )
+    assert plan is not None
+    # Simulate a filter with a value that must never become presentation text.
+    plan.filters = [FilterSpec(column=department, value="private-person@example.com", confidence=1.0)]
+    slots = [{"id": "departments", "field": "department_name", "splitField": "learning_status", "chartType": "stacked_bar"}]
+
+    presentation = _plan_presentation_spec(plan, slots, "top departments by users split by learning status")
+    _apply_plan_presentation_to_slots(plan, slots)
+
+    assert presentation["title"] == "Users by Department Name"
+    assert "Department Name" in presentation["subtitle"]
+    assert "private-person@example.com" not in presentation["subtitle"]
+    assert slots[0]["description"] == "Displays distinct users by Department Name split by Learning Status."
+
+
+def test_plan_presentation_describes_time_filter_with_validated_date_range():
+    user_id = ColumnProfile(
+        table="enrollment_fact", name="user_id", data_type="INTEGER", terms=frozenset({"user", "id"}), is_identifier=True, is_time=False
+    )
+    enrolled_at = ColumnProfile(
+        table="enrollment_fact", name="enrolled_at", data_type="TIMESTAMP", terms=frozenset({"enrolled", "at"}), is_identifier=False, is_time=True
+    )
+    plan = AnalyticalPlan(
+        intent="time_series",
+        base_table="enrollment_fact",
+        measure=user_id,
+        dimensions=[],
+        time_dimension=enrolled_at,
+        joins=[],
+        requested_terms=["monthly", "users", "over", "time"],
+    )
+    assert plan is not None
+    plan.filters = [FilterSpec(column=enrolled_at, value="2025-01-01", confidence=1.0, operator="gte")]
+
+    presentation = _plan_presentation_spec(plan, [{"field": "enrolled_at", "chartType": "line"}], "monthly users over time")
+
+    assert "monthly distinct users over time" in presentation["subtitle"]
+    assert "from 2025-01-01" in presentation["subtitle"]
+
+
+def test_thai_fallback_preserves_plan_based_topic_when_translation_is_unavailable(monkeypatch):
+    monkeypatch.setattr(agent, "_invoke_language_json", lambda **_kwargs: None)
+    activity = {
+        "layoutSpec": {
+            "title": "Users by Department",
+            "subtitle": "Shows distinct users grouped by Department; filtered to Enrollment from 2025-01-01.",
+        },
+        "summary": {"metricLabels": {}},
+        "chartSlots": [{"id": "departments", "title": "Users by Department", "data": []}],
+    }
+
+    localized = agent._localize_activity_to_thai("แสดงผู้ใช้ตามแผนก", activity)
+
+    assert "Department" not in localized["layoutSpec"]["title"]
+    assert agent._contains_thai(localized["layoutSpec"]["subtitle"])
 
 
 def test_aggregate_cache_activity_binds_generic_distinct_time_buckets(tmp_path):
@@ -181,6 +283,22 @@ def test_complex_planner_resolves_validated_join_path():
         ("user_id", "user_id"),
         ("institute_id", "institute_id"),
     }
+
+
+def test_date_filter_field_does_not_create_unrequested_time_chart():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    con.execute(
+        "create table dashboard_agent_enrollment_fact "
+        "(user_id integer, department_name varchar, learning_status varchar, enroll_date timestamp)"
+    )
+    plan = plan_complex_dashboard(
+        _catalog(con),
+        "rank top 8 department_name by distinct users split by learning_status "
+        "and filter enroll_date from 2025-01-01",
+    )
+    assert plan is not None
+    assert plan.time_dimension is None
 
 
 def test_complex_planner_does_not_invent_unrequested_filters(tmp_path):
@@ -421,7 +539,7 @@ def test_llm_chart_choices_do_not_collapse_meaningful_variety():
     }
 
 
-def test_duckdb_fallback_is_persisted_and_reused_as_graph_aggregate(tmp_path):
+def test_duckdb_fallback_is_persisted_and_reused_for_exact_normalized_question(tmp_path):
     graph_path = tmp_path / "graph.json"
     activity = {
         "datasets": {
@@ -445,14 +563,43 @@ def test_duckdb_fallback_is_persisted_and_reused_as_graph_aggregate(tmp_path):
     }
 
     assert write_graph_dashboard_cache(graph_path, "compare users by province and institute", activity)
-    cached = read_graph_dashboard_cache(graph_path, "compare user by institution and province")
+    cached = read_graph_dashboard_cache(graph_path, "  COMPARE users by province and institute  ")
 
     assert cached["summary"]["executionSource"] == "graph"
+    assert cached["summary"]["reasoningSource"] == "cache"
     assert cached["datasets"]["fact"]["object_type"] == "graph_dashboard_aggregate"
     assert cached["chartSlots"] == activity["chartSlots"]
     details = " ".join(str(item.get("detail") or "") for item in cached["decisionTrace"])
-    assert details == ""
+    assert "Reused a matching precomputed dashboard" in details
     assert "from duckdb context" not in details.lower()
+
+
+def test_dashboard_cache_rejects_stale_source_version(tmp_path):
+    graph_path = tmp_path / "graph.json"
+    activity = {
+        "datasets": {"fact": {"object_type": "duckdb_join_plan"}},
+        "chartSlots": [{"id": "users", "data": [{"label": "A", "value": 42}]}],
+    }
+
+    assert write_graph_dashboard_cache(
+        graph_path,
+        "show users by province",
+        activity,
+        source_version="warehouse-v1",
+    )
+
+    assert read_graph_dashboard_cache(
+        graph_path,
+        "show users by province",
+        source_version="warehouse-v2",
+    ) == {}
+    cached = read_graph_dashboard_cache(
+        graph_path,
+        "show users by province",
+        source_version="warehouse-v1",
+    )
+    assert cached["summary"]["reasoningSource"] == "cache"
+    assert cached["decisionTrace"]
 
 
 def test_thai_fallback_normalizes_processing_and_localizes_presentation(monkeypatch):
@@ -486,6 +633,118 @@ def test_thai_fallback_preserves_complex_analytical_structure(monkeypatch):
     assert "province" in canonical
     assert "split by" in canonical
     assert "institute" in canonical
+
+
+def test_english_canonicalization_preserves_full_multi_chart_request(monkeypatch):
+    monkeypatch.setattr(
+        agent,
+        "_invoke_language_json",
+        lambda **_kwargs: pytest.fail("English requests must not be rewritten by an LLM"),
+    )
+    question = (
+        "Build exactly three charts since 2025-01-01: top departments split by status; "
+        "overall status distribution; and monthly enrollment through June 2026."
+    )
+
+    canonical = agent._canonicalize_question_for_processing(question)
+
+    assert canonical == question
+    assert "top departments split by status" in canonical
+    assert "monthly enrollment" in canonical
+
+
+def test_date_filter_alone_is_not_time_series_intent():
+    assert not agent._semantic_time_intent(
+        "Rank the top provinces for enrollments since 2025-01-01"
+    )
+    assert agent._semantic_time_intent(
+        "Show monthly enrollments from January 2025 through June 2026"
+    )
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("Break each province down by learning status", "split by learning status"),
+        ("Break every bar down by status", "split by status"),
+        ("Show passed versus not passed", "split by course_pass"),
+        ("Break each province into passed versus not passed", "split by course_pass"),
+        ("Split into passed and not_passed", "split by passed and not_passed"),
+    ],
+)
+def test_canonical_normalization_recognizes_split_language(question, expected):
+    assert expected in agent._normalize_canonical_analytics_question(question).lower()
+
+
+def test_planner_recognizes_split_into_pass_status():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    con.execute(
+        "create table dashboard_agent_user_course_fact "
+        "(user_id integer, school_province varchar, course_pass integer, "
+        "has_certificate integer, enroll_date timestamp)"
+    )
+    plan = plan_complex_dashboard(
+        _catalog(con),
+        "Show top school provinces by distinct certified users since 2025-01-01 "
+        "split into passed and not_passed",
+    )
+    assert plan is not None
+    assert [column.name for column in plan.dimensions[:2]] == ["school_province", "course_pass"]
+    assert plan.time_dimension is None
+
+
+def test_measure_terms_and_word_top_limit_are_generic():
+    assert "user" in _measure_query_terms("top eight provinces by unique users")
+    assert "user" in _measure_query_terms(
+        "top departments by unique secondary-education enrolled users"
+    )
+    assert _requested_top_limit("which ten provinces have the most users") == 10
+
+
+def test_mixed_thai_schema_request_preserves_structured_clauses():
+    question = (
+        "เชื่อมตาราง enrollment fact กับ user dimension กรอง level_of_education เป็น secondary "
+        "และ enroll_date ตั้งแต่ 2025-01-01 ตัด department_name ที่ว่าง จัดอันดับ 8 อันดับด้วย "
+        "distinct users และแยก series ตาม learning_status โดยคืนเฉพาะข้อมูลรวม"
+    )
+    canonical = agent._canonicalize_question_for_processing(question, semantic_context={})
+    for term in (
+        "level_of_education",
+        "secondary",
+        "enroll_date",
+        "2025-01-01",
+        "department_name",
+        "distinct users",
+        "split by learning_status",
+    ):
+        assert term in canonical
+
+
+def test_explicit_measure_identity_beats_incidental_context():
+    fact = TableProfile(
+        name="dashboard_agent_user_course_fact",
+        columns={
+            name: ColumnProfile(
+                table="dashboard_agent_user_course_fact",
+                name=name,
+                data_type="VARCHAR",
+                terms=frozenset(name.removesuffix("_id").split("_")) | {"id"},
+                is_identifier=True,
+                is_time=False,
+            )
+            for name in ("user_id", "course_id")
+        },
+    )
+    chosen = _resolve_measure(
+        {fact.name: fact},
+        {"user", "course", "province"},
+        {"user"},
+        value_validator=None,
+        graph_hints={"fields": ["course_id"]},
+    )
+    assert chosen is not None
+    assert chosen.name == "user_id"
 
 
 def test_thai_localization_rejects_untranslated_model_output(monkeypatch):
@@ -577,9 +836,9 @@ def test_thai_localization_covers_mixed_labels_reasoning_and_category_values(mon
     assert "leads this comparison" not in localized["layoutSpec"]["subtitle"]
     assert "Learning Status" not in localized["chartSlots"][0]["title"]
     assert [row["series"] for row in localized["chartSlots"][0]["data"]] == [
-        "ผ่าน",
-        "กำลังเรียน",
-        "ไม่ได้ใช้งาน",
+        "Passed",
+        "In Progress",
+        "Inactive",
     ]
     assert localized["decisionTrace"][0]["stage"] == "Request interpretation"
     assert "Identify" not in localized["decisionTrace"][0]["detail"]
@@ -685,7 +944,7 @@ def test_shared_semantic_interpreter_normalizes_natural_prompt_with_schema_conte
     assert canonical == "show province by number of user_id ranked highest"
     assert captured["payload"]["schemaCatalog"][0]["fields"] == ["user_id", "province"]
     assert "Equivalent precise" in captured["system"]
-    assert read_question_translation(graph_path, f"analytics-v4:{question}") == canonical
+    assert read_question_translation(graph_path, f"analytics-v5:{question}") == canonical
 
 
 def test_shared_semantic_interpreter_has_deterministic_english_fallback(monkeypatch):
