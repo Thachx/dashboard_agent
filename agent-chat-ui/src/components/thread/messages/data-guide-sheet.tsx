@@ -5,7 +5,6 @@ import {
   BookOpen,
   ChevronDown,
   Fingerprint,
-  MessageSquareText,
   Search,
   Timer,
 } from "lucide-react";
@@ -110,12 +109,6 @@ function describeField(col: GuideColumn, tableName: string): string {
   const parts = [`${role} ฟิลด์`, `ใน ${humanizeField(tableName)}`];
   if (col.samples.length) parts.push(`เช่น ${col.samples.slice(0, 3).join(", ")}`);
   return parts.join(" \u00b7 ");
-}
-
-
-function askAboutField(col: GuideColumn): string {
-  const label = humanizeField(col.name);
-  return col.isTime ? `แสดง {label} ตามเวลา ${label}` : `แสดงการจำแนกตาม {label} ${label}`;
 }
 
 
@@ -358,21 +351,6 @@ export function DataGuideSheet() {
                             เช่น {col.samples.slice(0, 3).join(", ")}
                           </p>
                         ) : null}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            window.dispatchEvent(
-                              new CustomEvent("dashboard:prefill-question", {
-                                detail: askAboutField(col),
-                              }),
-                            );
-                            setOpen(false);
-                          }}
-                          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white shadow-xs transition hover:bg-blue-700"
-                        >
-                          <MessageSquareText className="h-3.5 w-3.5" aria-hidden="true" />
-                          ถามเกี่ยวกับฟิลด์นี้
-                        </button>
                       </div>
                     ))}
                   </div>
