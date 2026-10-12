@@ -72,3 +72,21 @@ export function parseGraphDashboardMarker(text: string): unknown {
   }
   return payload;
 }
+
+export function dashboardDocumentFromLangGraph(value: unknown): Record<string, unknown> | undefined {
+  const root = record(value);
+  const containers = [root.messages, record(root.values).messages, record(root.output).messages];
+  for (const messages of containers) {
+    if (!Array.isArray(messages)) continue;
+    for (const message of [...messages].reverse()) {
+      const item = record(message);
+      const role = String(item.role ?? item.type ?? "").toLowerCase();
+      if (role && !role.includes("assistant") && !role.includes("ai")) continue;
+      const document = record(item.additional_kwargs).dashboard_document;
+      if (document && typeof document === "object" && Array.isArray(record(document).charts)) {
+        return record(document);
+      }
+    }
+  }
+  return undefined;
+}

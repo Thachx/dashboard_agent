@@ -1,10 +1,10 @@
 import { demoDashboard } from "../shared/demo-dashboard.js";
 import {
-  dashboardFromGraphPayload,
+  DashboardDocumentSchema,
   dashboardFromTextResponse,
   type DashboardDocument,
 } from "../shared/dashboard-contract.js";
-import { assistantTextFromLangGraph, tryParseGraphDashboardMarker } from "./marker-parser.js";
+import { assistantTextFromLangGraph, dashboardDocumentFromLangGraph } from "./marker-parser.js";
 
 export interface DashboardRequest {
   question: string;
@@ -52,6 +52,23 @@ async function cancelRun(baseUrl: string, threadId: string, runId: string): Prom
   } catch {
     // Preserve the original request failure; cancellation is best-effort cleanup.
   }
+}
+
+function applyLimits(
+  document: DashboardDocument,
+  request: DashboardRequest,
+): DashboardDocument {
+  const charts = document.charts.slice(0, request.maxCharts ?? document.charts.length);
+  if (charts.length === document.charts.length) return document;
+  const visible = new Set(charts.map((chart) => chart.id));
+  return {
+    ...document,
+    charts,
+    layout: document.layout.filter((block) => {
+      if (block.type === "chart") return visible.has(block.slotId);
+      return true;
+    }),
+  };
 }
 
 export async function createDashboard(request: DashboardRequest): Promise<DashboardDocument> {
@@ -102,22 +119,25 @@ export async function createDashboard(request: DashboardRequest): Promise<Dashbo
     await cancelRun(settings.baseUrl, threadId, runId);
     throw error;
   }
-  const assistantText = assistantTextFromLangGraph(runResponse);
-  const graphPayload = tryParseGraphDashboardMarker(assistantText);
-  if (graphPayload === undefined) {
-    return dashboardFromTextResponse(assistantText, {
-      query: request.question,
-      locale: request.locale,
-      timezone: request.timezone,
-    });
+
+  // The Dashboard Agent backend is the single source of truth for the
+  // dashboard document: it builds the document from its activity context and
+  // attaches it to the assistant message (additional_kwargs.dashboard_document).
+  // This server only validates and forwards it; it does not re-derive charts,
+  // metrics, layout, or reasoning from the response text.
+  const upstreamDocument = dashboardDocumentFromLangGraph(runResponse);
+  if (upstreamDocument) {
+    const document = DashboardDocumentSchema.parse(upstreamDocument);
+    return applyLimits(document, request);
   }
-  const dashboard = dashboardFromGraphPayload(graphPayload, {
+
+  // Non-dashboard answers (plain text, no structured document) still get a
+  // chart-free document so the MCP client receives a valid result.
+  const assistantText = assistantTextFromLangGraph(runResponse);
+  const textDocument = dashboardFromTextResponse(assistantText, {
     query: request.question,
     locale: request.locale,
     timezone: request.timezone,
   });
-  return {
-    ...dashboard,
-    charts: dashboard.charts.slice(0, request.maxCharts ?? dashboard.charts.length),
-  };
+  return applyLimits(textDocument, request);
 }

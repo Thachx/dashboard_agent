@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   assistantTextFromLangGraph,
+  dashboardDocumentFromLangGraph,
   parseGraphDashboardMarker,
   tryParseGraphDashboardMarker,
 } from "../src/server/marker-parser";
@@ -37,5 +38,22 @@ describe("dashboard marker parser", () => {
   it("still rejects a truncated dashboard marker", () => {
     expect(() => tryParseGraphDashboardMarker('<<<GRAPH_DASHBOARD_WIDGET>>>{"title":"Partial"}'))
       .toThrow("incomplete graph dashboard widget payload");
+  });  it("reads the structured dashboard document from the assistant message", () => {
+    const response = {
+      values: {
+        messages: [
+          { type: "human", content: "question" },
+          {
+            type: "ai",
+            content: "marker text",
+            additional_kwargs: { dashboard_document: { charts: [], metrics: [] } },
+          },
+        ],
+      },
+    };
+    expect(dashboardDocumentFromLangGraph(response)).toMatchObject({ charts: [], metrics: [] });
+    expect(dashboardDocumentFromLangGraph({ values: { messages: [] } })).toBeUndefined();
+    expect(dashboardDocumentFromLangGraph({ values: { messages: [{ type: "ai", content: "no document" }] } })).toBeUndefined();
   });
+
 });

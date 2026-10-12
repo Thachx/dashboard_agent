@@ -15,7 +15,12 @@ from langgraph.graph.message import add_messages
 
 from dashboard_agent.config import Settings
 from dashboard_agent.dashboard_planner import build_complex_dashboard, _resolve_shape, _execute_shape, _thai_gloss, _thai_question_fully_glossable
-from dashboard_agent.dashboard_widget import dataset_summaries, graph_dashboard_marker
+from dashboard_agent.dashboard_widget import (
+    build_dashboard_document,
+    dataset_summaries,
+    graph_dashboard_payload,
+    render_dashboard_marker,
+)
 from dashboard_agent.graph_dashboard_cache import (
     read_graph_dashboard_cache,
     read_question_translation,
@@ -7175,6 +7180,7 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
             },
         )
     notices: list[str] = []
+    dashboard_document: dict[str, Any] | None = None
     wants_refresh = _wants_refresh(user_question)
     try:
         if wants_refresh:
@@ -7333,17 +7339,30 @@ def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
             activity = _localize_activity_to_thai(user_question, activity)
         title = "แดชบอร์ดข้อมูล" if _contains_thai(user_question) else ("Activity dashboard" if activity else "Dashboard graph")
         marker_results = [] if activity else results
-        answer = graph_dashboard_marker(
+        marker_payload = graph_dashboard_payload(
             status=store.status(),
             results=marker_results,
             activity=activity,
             title=title,
         )
+        if activity:
+            # The backend is the single source of truth for the renderable
+            # dashboard document; the MCP Apps server forwards it verbatim.
+            dashboard_document = build_dashboard_document(
+                payload=marker_payload,
+                query=user_question,
+                locale="th" if _contains_thai(user_question) else "en",
+                timezone="Asia/Bangkok",
+            )
+        answer = render_dashboard_marker(marker_payload)
     else:
         answer = _duckdb_basic_text_answer(_duckdb_database_path(store), user_question) or _llm_answer(user_question, results)
     if notices:
         answer = "\n\n".join(notices + [answer])
-    return {"messages": [AIMessage(content=answer)]}
+    message = AIMessage(content=answer)
+    if dashboard_document is not None:
+        message.additional_kwargs["dashboard_document"] = dashboard_document
+    return {"messages": [message]}
 
 
 def _is_complex_dashboard_request(question: str) -> bool:
