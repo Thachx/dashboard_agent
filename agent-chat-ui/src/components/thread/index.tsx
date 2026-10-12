@@ -35,6 +35,8 @@ import { clearGuestThreadId, ensureGuestId } from "@/lib/guest-session";
 import { useThreads } from "@/providers/Thread";
 import { getContentString } from "./utils";
 import { ThreadView } from "./agent-inbox";
+import { DataGuideSheet } from "./messages/data-guide-sheet";
+import { useFieldSuggest, FieldSuggestDropdown } from "./messages/field-suggest";
 import { isAgentInboxInterruptSchema } from "@/lib/agent-inbox-interrupt";
 import { GenericInterruptView } from "./messages/generic-interrupt";
 import { MarkdownText } from "./markdown-text";
@@ -83,7 +85,7 @@ function ScrollToBottom(props: { className?: string }) {
       onClick={() => scrollToBottom()}
     >
       <ArrowDown className="h-4 w-4" />
-      <span>Scroll to bottom</span>
+      <span>เลื่อนไปที่ด้านล่าง</span>
     </Button>
   );
 }
@@ -105,6 +107,19 @@ export function Thread() {
 
   const stream = useStreamContext();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const suggest = useFieldSuggest({ input, setInput, textareaRef });
+  // Prefill the input when a dashboard field guide asks a question.
+  useEffect(() => {
+    const onAsk = (e: Event) => {
+      const q = (e as CustomEvent<string>).detail;
+      if (typeof q === "string" && q.length) {
+        setInput(q);
+        textareaRef.current?.focus();
+      }
+    };
+    window.addEventListener("dashboard:prefill-question", onAsk);
+    return () => window.removeEventListener("dashboard:prefill-question", onAsk);
+  }, []);
   const messages = useMemo(() => {
     const raw = stream.messages ?? [];
     const lastIndexById = new Map<string, number>();
@@ -273,10 +288,10 @@ export function Thread() {
 
       // Message is defined, and it has not been logged yet. Save it, and send the error
       lastError.current = message;
-      toast.error("An error occurred. Please try again.", {
+      toast.error("เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง", {
         description: (
           <p>
-            <strong>Error:</strong> <code>{message}</code>
+            <strong>ข้อผิดพลาด:</strong> <code>{message}</code>
           </p>
         ),
         richColors: true,
@@ -345,7 +360,7 @@ export function Thread() {
     const needsThreadId = !threadId;
     const newThreadId = needsThreadId ? uuidv4() : undefined;
     const threadName =
-      getContentString(newHumanMessage.content).trim() || "New thread";
+      getContentString(newHumanMessage.content).trim() || "เธรดใหม่";
     const threadMetadata = needsThreadId
       ? { guest_id: guestId, thread_name: threadName }
       : { guest_id: guestId };
@@ -615,9 +630,10 @@ export function Thread() {
               </div>
 
               <div className="flex items-center gap-2">
+                <DataGuideSheet />
                 <TooltipIconButton
                   className="size-9 p-0"
-                  tooltip="New thread"
+                  tooltip="เธรดใหม่"
                   variant="ghost"
                   onClick={() => setThreadId(null)}
                 >
@@ -675,8 +691,9 @@ export function Thread() {
                   {!chatStarted && (
                     <div className="flex items-center gap-3">
                       <h1 className="text-2xl font-semibold tracking-tight">
-                        Agent Chat
+                        แชทเอเจนท์
                       </h1>
+                      <DataGuideSheet />
                     </div>
                   )}
 
@@ -693,6 +710,7 @@ export function Thread() {
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={(e) => {
+                          if (suggest.handleKeyDown(e)) return;
                           if (
                             e.key === "Enter" &&
                             !e.shiftKey &&
@@ -705,9 +723,18 @@ export function Thread() {
                             form?.requestSubmit();
                           }
                         }}
-                        placeholder="Type your message..."
+                        placeholder="พิมพ์ข้อความของคุณ..."
                         className="composer-scrollbar min-h-24 max-h-72 w-full resize-none overflow-hidden border-none bg-transparent p-3.5 pb-0 leading-6 shadow-none ring-0 outline-none focus:ring-0 focus:outline-none"
                       />
+                      {suggest.visible && (
+                        <FieldSuggestDropdown
+                          suggestions={suggest.suggestions}
+                          index={suggest.index}
+                          onPick={suggest.pick}
+                          onHover={suggest.setIndex}
+                          textareaRef={textareaRef}
+                        />
+                      )}
 
                       <div className="flex items-center gap-3 p-2 pt-4">
                         {stream.isLoading ? (
@@ -717,7 +744,7 @@ export function Thread() {
                             className="ml-auto"
                           >
                             <LoaderCircle className="h-4 w-4 animate-spin" />
-                            Cancel
+                            ยกเลิก
                           </Button>
                         ) : (
                           <Button
@@ -728,7 +755,7 @@ export function Thread() {
                               !input.trim()
                             }
                           >
-                            Send
+                            ส่ง
                           </Button>
                         )}
                       </div>

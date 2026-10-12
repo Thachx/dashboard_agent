@@ -1,13 +1,74 @@
+# Secrets / local config
 .env
 .env.local
-**/.env
-**/.env.local
-**/__pycache__/
-**/*.pyc
-**/.pytest_cache/
+.env.*.bak*
+.env.bak.*
+.env.pre-*
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Data, warehouses, and generated artifacts (never commit raw data)
+data/
 backend/data/
-backend/src/*.egg-info/
-agent-chat-ui/.next/
-agent-chat-ui/node_modules/
-backend/.langgraph_api/
+backend/backups/
+backend/_backups/
+backend/tmp/
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.pckl
+store.vectors*
+
+# LangGraph runtime state and logs
+.langgraph_api/
+.langgraph_api_backup_*/
+langgraph.log
+langgraph-*.log
+agent-chat-ui/next-*.log
+agent-chat-ui/next.log
+
+
+# Backups of source and test files
+*.bak_*
+*.bak-*
+
+# Scratch/tmp
 tmp/
+*.bak-*
+# Source backup snapshots
+*.bak_*
+*.bak-*
+
+# Scratch
+tmp/
+tmp/
+
+# IDE / agent tool local config
+.codex/
+.serena/
+
+# LangGraph runtime checkpoints
+backend/.langgraph_api/
+backend/langgraph-*.log
+*.log
+
+# Scratch probe scripts
+backend/_diag_*.py
+backend/_e2e_http.py
+backend/_probe_general.py

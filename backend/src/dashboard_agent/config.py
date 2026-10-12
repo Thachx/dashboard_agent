@@ -28,6 +28,9 @@ class Settings:
     openrouter_reserve_model_2: str | None = None
     openrouter_http_referer: str | None = None
     openrouter_title: str = "Dashboard Graph Agent"
+    gptoss_api_key: str | None = None
+    gptoss_model: str = "gpt-oss-120b"
+    gptoss_base_url: str = "http://127.0.0.1:18080/v1"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -56,6 +59,9 @@ class Settings:
             openrouter_reserve_model_2=os.getenv("OPENROUTER_RESERVE_MODEL_2"),
             openrouter_http_referer=os.getenv("OPENROUTER_HTTP_REFERER"),
             openrouter_title=os.getenv("OPENROUTER_TITLE", cls.openrouter_title),
+            gptoss_api_key=os.getenv("GPTOSS_API_KEY"),
+            gptoss_model=os.getenv("GPTOSS_MODEL", cls.gptoss_model),
+            gptoss_base_url=os.getenv("GPTOSS_BASE_URL", cls.gptoss_base_url),
         )
 
 

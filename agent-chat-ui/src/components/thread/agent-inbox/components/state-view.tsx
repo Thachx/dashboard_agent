@@ -243,7 +243,7 @@ export function StateView({
   const [expanded, setExpanded] = useState(false);
 
   if (!values) {
-    return <div>No state found</div>;
+    return <div>ไม่พบสถานะ</div>;
   }
 
   return (

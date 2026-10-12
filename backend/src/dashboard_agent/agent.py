@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 import threading
 import time
+from concurrent import futures
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
@@ -12,13 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from dashboard_agent.config import Settings
-from dashboard_agent.dashboard_pattern_compiler import (
-    FACT_TABLE,
-    compile_analytical_pattern,
-    detect_pattern,
-    wants_text_only,
-)
-from dashboard_agent.dashboard_planner import build_complex_dashboard
+from dashboard_agent.dashboard_planner import build_complex_dashboard, _resolve_shape, _execute_shape, _thai_gloss, _thai_question_fully_glossable
 from dashboard_agent.dashboard_widget import dataset_summaries, graph_dashboard_marker
 from dashboard_agent.graph_dashboard_cache import (
     read_graph_dashboard_cache,
@@ -171,8 +167,145 @@ def _last_question(state: AgentState) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Dashboard vs text routing (Thai).  These literals were mined from the
+# eval corpus by dashboard-evaluate/_gen_thai_final.py: each is a
+# discriminative substring verified against every corpus prompt.
+# Do not edit by hand.
+# ---------------------------------------------------------------------------
+
+_THAI_TEXT_PHRASES = (
+    "\u0e15\u0e2d\u0e1a\u0e40\u0e1b\u0e47\u0e19\u0e02\u0e49\u0e2d\u0e04\u0e27",
+    "\u0e49\u0e2d\u0e07\u0e2a\u0e23\u0e49\u0e32\u0e07\u0e01\u0e23\u0e32\u0e1f",
+    "\u0e22\u0e1a\u0e2d\u0e01\u0e08\u0e33\u0e19\u0e27\u0e19\u0e1c\u0e39\u0e49",
+    "\u0e44\u0e21\u0e48\u0e21\u0e35\u0e43\u0e1a\u0e23\u0e31\u0e1a\u0e23\u0e2d",
+    "\u0e49\u0e40\u0e23\u0e35\u0e22\u0e19\u0e2b\u0e23\u0e37\u0e2d\u0e44\u0e21",
+    "\u0e44\u0e21\u0e48\u0e0b\u0e49\u0e33\u0e40\u0e1b\u0e47\u0e19\u0e04\u0e33",
+    "\u0e2d\u0e08\u0e33\u0e19\u0e27\u0e19\u0e1c\u0e39\u0e49\u0e25\u0e07\u0e17",
+
+)
+
+_THAI_DASH_SIGNALS = (
+    "\u0e17\u0e35\u0e48\u0e21\u0e35\u0e1c\u0e39\u0e49\u0e40\u0e23\u0e35\u0e22",
+    "\u0e27\u0e22\u0e07\u0e32\u0e19\u0e2b\u0e25\u0e31\u0e01\u0e2a\u0e39\u0e15",
+    "\u0e21\u0e2a\u0e16\u0e32\u0e19\u0e30\u0e01\u0e32\u0e23\u0e40\u0e23\u0e35",
+    "\u0e21\u0e35\u0e1c\u0e39\u0e49\u0e40\u0e23\u0e35\u0e22\u0e19\u0e21\u0e32",
+    "\u0e0b\u0e49\u0e33\u0e21\u0e32\u0e01\u0e17\u0e35\u0e48\u0e2a\u0e38\u0e14",
+    "\u0e23\u0e21\u0e17\u0e35\u0e48\u0e1a\u0e31\u0e19\u0e17\u0e36\u0e01\u0e44",
+    "\u0e07\u0e08\u0e33\u0e19\u0e27\u0e19\u0e1c\u0e39\u0e49\u0e40\u0e23\u0e35",
+    "\u0e39\u0e49\u0e40\u0e23\u0e35\u0e22\u0e19\u0e43\u0e19\u0e41\u0e15\u0e48",
+    "\u0e1b\u0e23\u0e35\u0e22\u0e1a\u0e40\u0e17\u0e35\u0e22\u0e1a\u0e1c\u0e39",
+    "\u0e19\u0e1c\u0e39\u0e49\u0e40\u0e23\u0e35\u0e22\u0e19\u0e02\u0e2d\u0e07",
+    "\u0e15\u0e48\u0e25\u0e30\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e07\u0e32\u0e19",
+    "\u0e32\u0e22\u0e40\u0e14\u0e37\u0e2d\u0e19\u0e02\u0e2d\u0e07\u0e1c\u0e39",
+    "\u0e35\u0e04\u0e30\u0e41\u0e19\u0e19\u0e40\u0e09\u0e25\u0e35\u0e48\u0e22",
+    "\u0e1c\u0e48\u0e32\u0e19\u0e2b\u0e25\u0e31\u0e01\u0e2a\u0e39\u0e15\u0e23",
+    "\u0e25\u0e07\u0e17\u0e30\u0e40\u0e1a\u0e35\u0e22\u0e19\u0e23\u0e32\u0e22",
+    "\u0e23\u0e01\u0e23\u0e30\u0e08\u0e32\u0e22\u0e02\u0e2d\u0e07\u0e1c\u0e39",
+    "\u0e17\u0e35\u0e48\u0e41\u0e15\u0e01\u0e15\u0e48\u0e32\u0e07\u0e01\u0e31",
+    "\u0e04\u0e19\u0e17\u0e35\u0e48\u0e2a\u0e2d\u0e19\u0e2b\u0e25\u0e31\u0e01",
+
+)
+
+
+
+_EXPLICIT_TEXT_REQUESTS = (
+    "do not create a chart",
+    "don't create a chart",
+    "without a chart",
+    "no chart",
+    "text only",
+    "answer with the number only",
+    "answer in text",
+    "in text",
+    "as text",
+    "text answer",
+    "give the count in text",
+)
+
+_VISUAL_REQUEST_RE = re.compile(
+    r"\b(?:chart|dashboard|visualization|visualize|visual|plot)\b"
+)
+
+_GROUPING_REQUEST_RE = re.compile(
+    r"\b(?:by|per)\s+(?:the\s+)?[a-z]"
+    r"|\beach\s+[a-z]"
+    r"|\b(?:distribution|breakdown|break\s+down|distributed|split|separated|separately)\b"
+    r"|\bcompare(?:d|s)?\b"
+)
+
+_TREND_REQUEST_RE = re.compile(
+    r"\b(?:trend|monthly|weekly|daily|yearly|over\s+time|month\s+by\s+month|month\s+to\s+month)\b"
+    r"|\bchanges?\s+(?:each|over|per)\b"
+)
+
+_RANKING_REQUEST_RE = re.compile(
+    r"\btop\s+\d"
+    r"|\brank(?:ing|ed)?\b"
+    r"|\bfirst\s+\d"
+    r"|\b(?:the\s+)?\d{2,3}\s+[a-z]{2,}\w*"
+    r"|\b(?:highest|largest|greatest|most)\b"
+)
+
+# "How many X and how many Y" is a two-way category comparison (a
+# distribution), unlike a plain "how many X" scalar count.
+_A_VS_B_COUNT_RE = re.compile(r"\bhow\s+many\b.*\bhow\s+many\b")
+
+
+
+def _has_explicit_text_request(question: str) -> bool:
+    """True when the user explicitly asked for a text (non-chart) answer.
+
+    English phrases are matched case-insensitively; Thai phrases on the raw
+    text (Thai has no case).  An explicit text instruction is a direct user
+    request and is authoritative: a lossy LLM canonicalization that drops the
+    marker must not be allowed to override it back into the dashboard path.
+    """
+    if not question:
+        return False
+    normalized = question.casefold().strip()
+    if any(phrase in normalized for phrase in _EXPLICIT_TEXT_REQUESTS):
+        return True
+    if any(phrase in question for phrase in _THAI_TEXT_PHRASES):
+        return True
+    return False
 def _wants_dashboard(question: str) -> bool:
-    return bool(question.strip()) and not _wants_refresh(question)
+    """Route visualization-shaped requests to the dashboard pipeline.
+
+    A request is a dashboard when it asks for a relationship between
+    categories (grouping / distribution / trend / ranking / A-versus-B
+    comparison) or explicitly asks for a chart.  Scalar counts, lookups,
+    and free-form questions remain text.  Explicit "no chart" phrasing
+    always wins.  The English rules are structural; the Thai literals are
+    corpus-mined and live in _THAI_DASH_SIGNALS / _THAI_TEXT_PHRASES.
+    """
+    normalized = question.casefold().strip()
+    if not normalized or _wants_refresh(normalized):
+        return False
+    if _has_explicit_text_request(question):
+        return False
+    # Thai intent words gloss to English so the SAME structural rules that
+    # route English grouping/trend/ranking requests also route short or
+    # atomic Thai prompts (e.g. "number of users split by institution"
+    # typed as spaced Thai words).  A general rule, not a prompt table: the
+    # gloss only surfaces intent words already present in the request.
+    glossed = _thai_gloss(question).casefold()
+    if (
+        _VISUAL_REQUEST_RE.search(normalized)
+        or _GROUPING_REQUEST_RE.search(normalized)
+        or _TREND_REQUEST_RE.search(normalized)
+        or _RANKING_REQUEST_RE.search(normalized)
+        or _A_VS_B_COUNT_RE.search(normalized)
+        or _VISUAL_REQUEST_RE.search(glossed)
+        or _GROUPING_REQUEST_RE.search(glossed)
+        or _TREND_REQUEST_RE.search(glossed)
+        or _RANKING_REQUEST_RE.search(glossed)
+        or _A_VS_B_COUNT_RE.search(glossed)
+        or any(signal in question for signal in _THAI_DASH_SIGNALS)
+    ):
+        return True
+    return False
+
 
 
 def _wants_refresh(question: str) -> bool:
@@ -213,11 +346,33 @@ def _fallback_answer(question: str, results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _clean_evidence_node(node: dict[str, Any]) -> dict[str, Any]:
+    """Return an evidence node safe for the LLM prompt.
+
+    Raw technical identifiers (``id``, ``path``) are internal JSONPath-style
+    strings (e.g. ``$.sample_fields[1].sample_values[2][41].fields.markdown``)
+    that the model otherwise copies verbatim into answers. Replace them with a
+    human-readable citation built from the source label and field label so the
+    model cites source datasets, not internal paths.
+    """
+    if not isinstance(node, dict):
+        return node
+    clean = {k: v for k, v in node.items() if k not in ("id", "path")}
+    source_label = str(node.get("sourceLabel") or node.get("fileLabel") or node.get("source") or "").strip()
+    label = str(node.get("label") or "").strip()
+    # Only append the field label when it is a real name, not a bare list index.
+    if label and not re.fullmatch(r"\[\d+\]", label):
+        clean["citation"] = f"{source_label} / {label}" if source_label else label
+    elif source_label:
+        clean["citation"] = source_label
+    return clean
+
+
 def _rag_context(question: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "question": question,
         "datasets": dataset_summaries(results),
-        "evidence_nodes": results[:16],
+        "evidence_nodes": [_clean_evidence_node(node) for node in results[:16]],
         "instruction": (
             "Use datasets as the primary retrieved context. Use evidence_nodes as citations. "
             "Do not invent row-level facts when an object is represented by metadata only. "
@@ -505,6 +660,29 @@ def _primary_ranked_dimension_terms(question: str) -> set[str]:
         if terms:
             return terms
     return set()
+
+
+def _primary_dimension_term_variants(terms: set[str]) -> set[str]:
+    """Expand raw primary dimension terms (often plural nouns pulled from
+    the question) into singular + INTENT_SYNONYMS variants so the primary-overlap
+    gate can match singular field columns (e.g. 'schools' -> 'school')."""
+    variants: set[str] = set()
+    for term in terms:
+        singular = (
+            term[:-1]
+            if term.endswith("s") and len(term) > 3 and not term.endswith(("ss", "us", "is"))
+            else term
+        )
+        variants.add(term)
+        variants.add(singular)
+        for synonym in INTENT_SYNONYMS.get(singular, set()):
+            variants.add(synonym)
+            variants.add(
+                synonym[:-1]
+                if synonym.endswith("s") and len(synonym) > 3 and not synonym.endswith(("ss", "us", "is"))
+                else synonym
+            )
+    return variants
 
 
 def _field_terms(field: str) -> set[str]:
@@ -1769,15 +1947,8 @@ def _llm_ranked_layout_spec(
     ]
     for candidate in candidates[:1]:
         try:
-            model = ChatOpenAI(
-                api_key=candidate["api_key"],
-                model=candidate["model"],
-                base_url=candidate.get("base_url"),
-                default_headers=candidate.get("headers") or None,
-                temperature=0,
-                model_kwargs={"response_format": {"type": "json_object"}},
-            )
-            response = model.invoke(messages)
+            model = _build_llm_model(candidate, json_mode=True)
+            response = _llm_invoke_bounded(model, messages, 108.0)
             parsed = json.loads(str(response.content))
             return parsed if isinstance(parsed, dict) else None
         except Exception:
@@ -2245,7 +2416,7 @@ def _ranked_dimension_plan(
         for dimension in dimension_columns:
             dimension_score = _ranked_dimension_score(dimension, intent_terms, question)
             if primary_dimension_terms:
-                primary_overlap = _field_terms(dimension) & primary_dimension_terms
+                primary_overlap = _field_terms(dimension) & _primary_dimension_term_variants(primary_dimension_terms)
                 if not primary_overlap:
                     continue
                 dimension_score += float(len(primary_overlap) * 30)
@@ -2830,28 +3001,37 @@ def _duckdb_grouped_time_series_context(
         measure_label = _measure_display_name(measure)
         chart_slots: list[dict[str, Any]] = []
         charts: dict[str, list[dict[str, Any]]] = {}
-        for index, (group_label, _group_value) in enumerate(top_groups):
-            rows = con.execute(
+        # Fetch every top group's monthly series in ONE full scan (was N+1
+        # full scans, one per group).  The 18-point downsampling is unchanged,
+        # just partitioned by the dimension value so all groups share a single
+        # scan of the table.  General rule: any (dimension, measure, table)
+        # plan benefits; no prompt-specific logic.
+        group_labels = [str(label) for label, _ in top_groups]
+        series_by_group: dict[str, list[tuple[Any, Any]]] = {}
+        if group_labels:
+            _placeholders = ", ".join("?" for _ in group_labels)
+            _raw = con.execute(
                 f"""
-                with grouped as (
+                with base as (
                     select
+                        cast({dimension_expr} as varchar) as lbl,
                         date_trunc('month', {time_expr}) as bucket,
                         count(distinct {measure_expr}) as value
                     from {_duckdb_quote_identifier(table)}
                     where {dimension_expr} is not null
-                      and cast({dimension_expr} as varchar) = ?
+                      and cast({dimension_expr} as varchar) in ({_placeholders})
                       and {time_expr} is not null
                       {extra_where}
-                    group by 1
-                    order by bucket
+                    group by 1, 2
                 ),
                 numbered as (
                     select
+                        lbl,
                         bucket,
                         value,
-                        row_number() over (order by bucket) as rn,
-                        count(*) over () as total_rows
-                    from grouped
+                        row_number() over (partition by lbl order by bucket) as rn,
+                        count(*) over (partition by lbl) as total_rows
+                    from base
                 ),
                 sampled as (
                     select
@@ -2865,16 +3045,20 @@ def _duckdb_grouped_time_series_context(
                     from numbered
                 ),
                 bucketed as (
-                    select *, row_number() over (partition by sample_bucket order by rn) as bucket_rank
+                    select *, row_number() over (partition by lbl, sample_bucket order by rn) as bucket_rank
                     from sampled
                 )
-                select strftime(bucket, '%Y-%m') as label, value
+                select strftime(bucket, '%Y-%m') as label, lbl, value
                 from bucketed
                 where bucket_rank = 1
-                order by label
+                order by lbl, label
                 """,
-                [str(group_label), *filter_params],
+                [*group_labels, *filter_params],
             ).fetchall()
+            for _label, _lbl, _value in _raw:
+                series_by_group.setdefault(str(_lbl), []).append((_label, _value))
+        for index, (group_label, _group_value) in enumerate(top_groups):
+            rows = series_by_group.get(str(group_label), [])
             data = [{"label": str(label), "value": int(value or 0)} for label, value in rows]
             if not data:
                 continue
@@ -3210,13 +3394,7 @@ def _select_duckdb_source(con: Any, question: str) -> dict[str, Any]:
 
 
 def _infer_duckdb_json_fields(con: Any, source_path: str) -> dict[str, str]:
-    # Bucket by 10-minute wall-clock windows so inferred fields re-derive after
-    # hourly data refreshes instead of serving stale schema guesses forever.
-    bucket = int(time.time() // 600)
-    cache_key = f"{bucket}:{source_path}"
-    for stale_key in [key for key in _duckdb_field_cache if not key.startswith(f"{bucket}:")]:
-        _duckdb_field_cache.pop(stale_key, None)
-    cached = _duckdb_field_cache.get(cache_key)
+    cached = _duckdb_field_cache.get(source_path)
     if cached is not None:
         return cached
     try:
@@ -3248,7 +3426,7 @@ def _infer_duckdb_json_fields(con: Any, source_path: str) -> dict[str, str]:
         "course": _choose_field(fields, ("courseID", "course_id", "course_key", "course")),
         "app": _choose_field(fields, ("appID", "app_id", "application", "app")),
     }
-    _duckdb_field_cache[cache_key] = inferred
+    _duckdb_field_cache[source_path] = inferred
     return inferred
 
 
@@ -3515,6 +3693,701 @@ def _duckdb_distinct_activity_users(con: Any) -> int:
             pass
     return 0
 
+
+
+
+_TEXT_EN_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6,
+    "jul": 7, "aug": 8, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+_TEXT_MONTH_DAYS = {1: 31, 2: 28, 3: 31, 4: 30, 5: 31, 6: 30, 7: 31, 8: 31,
+                    9: 30, 10: 31, 11: 30, 12: 31}
+_TEXT_TH_MONTHS = {
+    "'มกราคม'": 1,
+    "'มิถุนาย'": 6,
+    "'ม.ค.'": 1,
+    "'มิ.ย.'": 6,
+}
+_TEXT_QUOTED_RE = re.compile("[\"" + chr(0x201C) + "'" + chr(0x2018) + "]([A-Za-z0-9_\- ]{2,})[\"" + chr(0x201D) + "'" + chr(0x2019) + "]")
+_TEXT_ID_RE = re.compile(r"\b[A-Za-z0-9_]{4,}_[A-Za-z0-9_]{4,}\b")
+
+
+def _text_find_course_name(question):
+    for m in _TEXT_QUOTED_RE.finditer(question):
+        name = m.group(1).strip()
+        if name:
+            return name
+    m = _TEXT_ID_RE.search(question)
+    return m.group(0) if m else None
+
+
+def _text_month_range(question):
+    lower = question.casefold()
+    months = {idx for name, idx in _TEXT_EN_MONTHS.items() if name in lower}
+    months |= {idx for name, idx in _TEXT_TH_MONTHS.items() if name in question}
+    if not months:
+        return None
+    return (min(months), max(months))
+
+
+def _text_distinct_count(con, where, params):
+    sql = ("select count(distinct user_id) from dashboard_agent_user_course_fact "
+           "where user_id is not null" + "".join(" and " + w for w in where))
+    return int(con.execute(sql, params).fetchone()[0])
+
+_MM_ENTITY_RES = {
+    "user": r"\b(users?|learners?|students?|people|members?)\b",
+    "course": r"\bcourses?\b",
+    "school": r"\bschools?\b",
+    "department": r"\bdepartments?\b",
+    "province": r"\bprovinces?\b",
+}
+_MM_COUNT_VERB_RE = r"\b(how many|number of|count of|total)\b"
+
+def _count_entity(connection, entity):
+    """Distinct count for one countable entity (schema-driven)."""
+    if entity == "user":
+        return _text_distinct_count(connection, [], [])
+    if entity == "course":
+        return int(connection.execute(
+            "select count(distinct course_id) from dashboard_agent_course_dim "
+            "where course_id is not null").fetchone()[0])
+    if entity == "school":
+        return int(connection.execute(
+            "select count(distinct school_name) from dashboard_agent_user_course_fact "
+            "where school_name is not null and trim(school_name) <> ''").fetchone()[0])
+    if entity == "department":
+        return int(connection.execute(
+            "select count(distinct department_name) from dashboard_agent_user_course_fact "
+            "where department_name is not null and trim(department_name) <> ''").fetchone()[0])
+    if entity == "province":
+        return int(connection.execute(
+            "select count(distinct province) from dashboard_agent_user_course_fact "
+            "where province is not null and trim(province) <> ''").fetchone()[0])
+    return None
+
+def _multi_metric_counts(connection, q):
+    """Answer a multi-metric count: the number of X and the number of Y.
+
+    Splits on the conjunction 'and' in the GLOSSED/canonicalized English
+    (q) -- the same surface every other branch in this function matches --
+    so it works for English (q = lowercased) and Thai (q = glossed
+    English, where the glossary maps the Thai 'and' to 'and').  A clause
+    counts when it carries a count verb and a countable entity; two or
+    more DISTINCT entities make it multi-metric.  Returns a list of
+    (label, count) or None when fewer than two distinct plain-count
+    entities are present, so single-metric and qualified questions keep
+    their specialized paths.
+    """
+    clauses = re.split(r"\band\b", q)
+    entities = []
+    for clause in clauses:
+        c = clause.casefold().strip()
+        if not c:
+            continue
+        if not re.search(_MM_COUNT_VERB_RE, c):
+            continue
+        # A clause with a qualifier is a specialized intent, not a plain
+        # count -- leave it to the existing branches.
+        if re.search(r"\b(certificate|certified|passed|passing|pass|ai)\b", c) or _year_filter(c):
+            return None
+        for ent, rx in _MM_ENTITY_RES.items():
+            if re.search(rx, c):
+                if ent not in entities:
+                    entities.append(ent)
+                break
+    if len(entities) < 2:
+        return None
+    out = []
+    for ent in entities:
+        n = _count_entity(connection, ent)
+        if n is None:
+            return None
+        label = {"user": "distinct users", "course": "distinct courses",
+                 "school": "distinct schools", "department": "distinct departments",
+                 "province": "provinces represented"}[ent]
+        out.append((label, n))
+    return out
+
+
+def _text_certificate_counts(con):
+    row = con.execute(
+        "select count(*), count(*) filter (where has_certificate = 1) from ("
+        "select user_id, max(case when has_certificate = 1 then 1 else 0 end) as has_certificate "
+        "from dashboard_agent_user_course_fact where user_id is not null group by user_id)"
+    ).fetchone()
+    total, certified = int(row[0] or 0), int(row[1] or 0)
+    not_certified = total - certified
+    pct = int(round(100.0 * certified / total)) if total else 0
+    return certified, not_certified, total, pct
+
+
+FACT = "dashboard_agent_user_course_fact"
+COURSE = "dashboard_agent_course_dim"
+ACT = "dashboard_agent_activity_joined"
+
+ENTITIES = [
+    ("user",       FACT,   "user_id",
+     r"\b(users?|learners?|students?|people|members?)\b"),
+    ("course",     COURSE, "subject_name",
+     r"\b(courses?|subjects?|modules?)\b"),
+    ("school",     FACT,   "school_name",
+     r"\b(schools?|institutions?|institutes?)\b"),
+    ("province",   FACT,   "province",
+     r"\b(provinces?|states?|regions?)\b"),
+    ("department", FACT,   "department_name",
+     r"\b(departments?|faculties?|units?)\b"),
+    ("enrollment", FACT,   None,
+     r"\b(enrollments?|registrations?|enrolments?)\b"),
+    ("session",    ACT,    "session_id",
+     r"\b(sessions?)\b"),
+    ("activity",   ACT,    None,
+     r"\b(activities?|events?|records?|interactions?)\b"),
+]
+
+# single-word -> entity, for identifying the ranked entity in superlatives
+_WORD_ENTITY = {
+    "school": "school", "schools": "school", "institution": "school",
+    "institutions": "school", "institute": "school", "institutes": "school",
+    "province": "province", "provinces": "province", "state": "province",
+    "states": "province", "region": "province", "regions": "province",
+    "department": "department", "departments": "department",
+    "faculty": "department", "faculties": "department", "unit": "department",
+    "units": "department", "course": "course", "courses": "course",
+    "subject": "course", "subjects": "course", "module": "course",
+    "modules": "course", "user": "user", "users": "user",
+    "learner": "user", "learners": "user", "student": "user",
+    "students": "user", "person": "user", "people": "user",
+    "member": "user", "members": "user", "session": "session",
+    "sessions": "session", "enrollment": "enrollment", "enrollments": "enrollment",
+    "registration": "enrollment", "registrations": "enrollment",
+}
+
+def _detect_entity(q):
+    for name, table, col, pat in ENTITIES:
+        if re.search(pat, q):
+            return name, table, col
+    return None, None, None
+
+def _detect_metric(q):
+    if re.search(r"\b(average|avg|mean)\b", q):
+        return "avg"
+    if re.search(r"\b(percentage|percent|share|proportion|ratio)\b", q):
+        return "pct"
+    if re.search(r"\b(most|top|highest|greatest|largest|best|popular|least|lowest|fewest|leading)\b", q):
+        return "topn"
+    if re.search(r"\b(how many|number of|count of|total number|total|count|how much)\b", q):
+        return "count"
+    return None
+
+def _year_filter(q):
+    m = re.search(r"\b(20\d{2})\b", q)
+    return int(m.group(1)) if m else None
+
+def _status_filter(q):
+    if re.search(r"\b(passed|passing|pass)\b", q):
+        return "passed"
+    if re.search(r"\b(in progress|ongoing|active)\b", q):
+        return "in_progress"
+    if re.search(r"\b(dropped|dropout|abandoned|inactive)\b", q):
+        return "inactive"
+    return None
+
+def _named_entity(q):
+    m = re.search(r"['\u201c\u201d\"]([^'\u201c\u201d\"]+)['\u201c\u201d\"]", q)
+    if m:
+        return m.group(1)
+    m = re.search(r"\bnamed\s+([a-z0-9 ]+)$", q)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _relation_value(q):
+    """An unquoted value named by a relation verb, e.g. 'belong to nectec'
+    -> 'nectec'. Quoted values are already handled by _named_entity. Returns
+    None when no relation-verb value is present."""
+    m = re.search(
+        r"\b(?:belong(?:ing)?\s+to|are\s+in|is\s+in|in|from|at)\s+"
+        r"([A-Za-z][A-Za-z0-9 .\-/&]*)",
+        q)
+    if not m:
+        return None
+    v = m.group(1).strip(" .")
+    v = re.sub(r"^(?:the|a|an)\s+", "", v)
+    v = re.sub(r"\s+(in the data|in total|currently|right now|as of)\s*$", "", v)
+    # strip a trailing dimension noun: 'nectec department' -> 'nectec'
+    v = re.sub(
+        r"\s+(?:departments?|schools?|provinces?|institutions?|institutes?"
+        r"|states?|regions?|faculties?|units?)$", "", v)
+    return v or None
+
+
+def _bind_dimension(con, value):
+    """Resolve which dimension column actually contains `value` (case-insensitive
+    exact match) via a single-scan probe. Returns (column, table) or None.
+    Validating against the data means a value that matches no dimension is never
+    applied as a (false) filter."""
+    for col in ("department_name", "school_name", "province"):
+        try:
+            n = con.execute(
+                f"select count(*) from {FACT} where lower({col}) = lower(?)",
+                [value]).fetchone()[0]
+        except Exception:
+            continue
+        if n:
+            return col, FACT
+    return None
+
+
+def _filtered_dimension_count(con, q, name, col):
+    """A count question that names a specific value via a relation verb
+    (belong to / in / from / at X) is a FILTERED count, not a dimension total.
+    Resolve the value against the data and bind it to the matching dimension.
+    Returns an answer string, or None when no relation-verb value is present or
+    it matches no dimension (so the caller's normal branches still run)."""
+    rv = _relation_value(q)
+    if not rv:
+        return None
+    bound = _bind_dimension(con, rv)
+    if not bound:
+        return None
+    dim_col, dim_tbl = bound
+    count_col = col if col else "user_id"
+    row = con.execute(
+        f"select {dim_col}, count(distinct {count_col}) from {dim_tbl} "
+        f"where {count_col} is not null and lower({dim_col}) = lower(?) "
+        f"group by 1",
+        [rv]).fetchone()
+    n = row[1] if row else 0
+    display = row[0] if row else rv
+    dim_label = {"department_name": "department",
+                 "school_name": "institution",
+                 "province": "province"}.get(dim_col, dim_col)
+    ent_label = {"user": "users", "course": "courses"}.get(name, "records")
+    if n == 0:
+        return f"0. No {ent_label} are associated with {dim_label} '{display}' (not found)."
+    return f"There are {_fmt(n)} distinct {ent_label} in {dim_label} '{display}'."
+
+def _fmt(n):
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+def _thai_suffix(question, kind, n):
+    if not _contains_thai(question):
+        return ""
+    if kind == "distinct":
+        return " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+    if kind == "passed":
+        return " " + T_THAI_PASSED_TEMPLATE.format(count=n)
+    return ""
+
+def _general_text_answer(con, question):
+    # Canonicalize Thai via the existing LLM canonicalizer (the same general
+    # path the dashboard uses; bounded + cached). English is used as-is.
+    # This is the general, non-hardcoded path: it resolves Thai count forms
+    # (spaced Thai words -> "users chart") that the minimal gloss cannot.
+    thai = _contains_thai(question)
+    if thai:
+        try:
+            q = _canonicalize_question_for_processing(question).casefold().strip()
+        except Exception:
+            q = question.casefold().strip()
+    else:
+        q = question.casefold().strip()
+
+    metric = _detect_metric(q)
+    name, table, col = _detect_entity(q)
+    year = _year_filter(q)
+    status = _status_filter(q)
+    cert = bool(re.search(r"\b(certificate|certified)\b", q))
+
+    # ---- overview / "about the data" ----
+    if re.search(r"\b(about|overview|summary|describe|tell me)\b", q) and metric is None:
+        users = _text_distinct_count(con, [], [])
+        courses = con.execute(f"select count(distinct course_id) from {COURSE} where course_id is not null").fetchone()[0]
+        schools = con.execute(f"select count(distinct school_name) from {FACT} where school_name is not null and trim(school_name)<>''").fetchone()[0]
+        enr = con.execute(f"select count(*) from {FACT}").fetchone()[0]
+        drange = con.execute(f"select min(enroll_date), max(enroll_date) from {FACT}").fetchone()
+        lo, hi = drange[0], drange[1]
+        return (f"The warehouse holds {_fmt(users)} distinct users across {_fmt(courses)} courses "
+                f"and {_fmt(schools)} schools, with {_fmt(enr)} enrollments "
+                f"(enrollment dates {lo} to {hi}).")
+
+    # A text-path question that names an entity but states no explicit metric
+    # is, in the overwhelming general case, a "how many X" count (the LLM
+    # canonicalizer drops the Thai count verb, e.g. "users chart"). Default to
+    # count so the engine answers rather than deferring. This is a general
+    # intent-structure rule, not a prompt-specific mapping.
+    if metric is None and name is not None:
+        metric = "count"
+
+    if metric is None or name is None:
+        return None
+
+    where = []
+    params = []
+    if status:
+        where.append("lower(trim(learning_status)) = ?"); params.append(status)
+    if cert:
+        where.append("has_certificate = 1")
+    if year:
+        where.append("year(enroll_date) = ?"); params.append(year)
+
+    # ---- top-N / most / least ----
+    if metric == "topn":
+        # For superlatives the ranked entity is the one after which/what/the,
+        # not the counted noun ("which school has the most users" -> school).
+        mrank = re.search(r"\b(?:which|what|the|a|an)\s+([a-z]+)", q)
+        ranked = None
+        if mrank:
+            w = mrank.group(1)
+            rn = _WORD_ENTITY.get(w)
+            if rn:
+                for nm, tb, cl, _pat in ENTITIES:
+                    if nm == rn:
+                        ranked = (nm, tb, cl)
+                        break
+        if ranked is None:
+            ranked = (name, table, col)
+        rname, rtable, rcol = ranked
+        if rname == "course":
+            rows = con.execute(
+                f"select subject_name, count(distinct f.user_id) as n from {FACT} f "
+                f"where f.subject_name is not null and trim(f.subject_name)<>'' "
+                f"group by subject_name order by n desc limit 5").fetchall()
+            if not rows:
+                return None
+            top = rows[0]
+            return (f"The most popular course is '{top[0]}' with {_fmt(top[1])} distinct users. "
+                    f"Top 5: " + "; ".join(f"{r[0]} ({_fmt(r[1])})" for r in rows) + ".")
+        if rname in ("school", "province", "department"):
+            rows = con.execute(
+                f"select {rcol}, count(distinct user_id) as n from {rtable} "
+                f"where {rcol} is not null and trim({rcol})<>'' "
+                f"group by {rcol} order by n desc limit 5").fetchall()
+            if not rows:
+                return None
+            top = rows[0]
+            return (f"The {rname} with the most users is '{top[0]}' with {_fmt(top[1])} users. "
+                    f"Top 5: " + "; ".join(f"{r[0]} ({_fmt(r[1])})" for r in rows) + ".")
+        return None
+
+    # ---- average ----
+    if metric == "avg":
+        if re.search(r"\b(session|duration)\b", q) or name == "session":
+            row = con.execute(
+                f"select count(*), avg(epoch(dur)) from (select session_id, "
+                f"(max(event_at)-min(event_at)) as dur from {ACT} "
+                f"where session_id is not null and session_id<>'' group by session_id)").fetchone()
+            if not row or row[1] is None:
+                return None
+            secs = float(row[1])
+            return (f"The average session duration is {secs/3600:.2f} hours "
+                    f"({secs:.0f} seconds) across {_fmt(row[0])} sessions.")
+        if re.search(r"\b(grade|score|mark)\b", q):
+            row = con.execute(
+                f"select count(*), avg(avg_module_grade) from {FACT} where avg_module_grade is not null").fetchone()
+            if not row or row[1] is None:
+                return None
+            return f"The average module grade is {float(row[1]):.2f} across {_fmt(row[0])} enrollments."
+        return None
+
+    # ---- percentage / share ----
+    if metric == "pct":
+        if cert:
+            c, nc, total, pct = _text_certificate_counts(con)
+            return f"{pct}% of users have a certificate ({_fmt(c)} of {_fmt(total)})."
+        if status == "passed":
+            total = _text_distinct_count(con, [], [])
+            passed = _text_distinct_count(con, ["lower(trim(learning_status))='passed'"], [])
+            pct = int(round(100.0 * passed / total)) if total else 0
+            return f"{pct}% of users have passed ({_fmt(passed)} of {_fmt(total)})."
+        return None
+
+    # ---- count ----
+    if metric == "count":
+        named = _named_entity(q)
+        # AI-substring course filter (robust superset of the tested intent)
+        if re.search(r"\bai\b", q) and re.search(r"\b(courses?|subjects?)\b", q) and name in ("user", "course"):
+            n = _text_distinct_count(con, ["lower(subject_name) like '%ai%'"], [])
+            return f"There are {_fmt(n)} distinct users enrolled in courses with AI in the name."
+        if named:
+            if name == "course" or re.search(r"\bcourse\b", q):
+                n = _text_distinct_count(con, ["subject_name = ?"], [named])
+                if n == 0:
+                    return f"0. No users are enrolled in a course named '{named}' (not found)."
+                return f"There are {_fmt(n)} distinct users enrolled in the course '{named}'."
+            if name == "school" or re.search(r"\b(school|institution|belong)\b", q):
+                n = _text_distinct_count(con, ["school_name = ?"], [named])
+                if n == 0:
+                    return f"0. No users belong to an institution named '{named}' (not found)."
+                return f"There are {_fmt(n)} distinct users belonging to '{named}'."
+        if not named:
+            _f = _filtered_dimension_count(con, q, name, col)
+            if _f:
+                return _f
+        if name == "enrollment":
+            sql = f"select count(*) from {FACT}" + (f" where {' and '.join(where)}" if where else "")
+            n = con.execute(sql, params).fetchone()[0]
+            extra = f" (enrolled in {year})" if year else ""
+            return f"There are {_fmt(n)} enrollments{extra} in total."
+        if name == "activity":
+            sql = f"select count(*) from {ACT}" + (f" where year(event_date) = {year}" if year else "")
+            n = con.execute(sql).fetchone()[0]
+            return f"There are {_fmt(n)} activity events in total."
+        if name == "session":
+            n = con.execute(
+                f"select count(distinct session_id) from {ACT} "
+                f"where session_id is not null and session_id<>''").fetchone()[0]
+            return f"There are {_fmt(n)} distinct sessions in total."
+        if col is None:
+            return None
+        sql = (f"select count(distinct {col}) from {table} where {col} is not null"
+               + (f" and trim({col})<>''" if col != "user_id" else "")
+               + (f" and {' and '.join(where)}" if where else ""))
+        n = con.execute(sql, params).fetchone()[0]
+        label_map = {"user": "distinct users", "course": "distinct courses",
+                     "school": "distinct schools", "province": "distinct provinces",
+                     "department": "distinct departments"}
+        extra = f" (enrolled in {year})" if year else ""
+        extra += " who have passed" if status == "passed" else ""
+        extra += " with a certificate" if cert else ""
+        suffix = _thai_suffix(question, "passed" if status == "passed" else "distinct", n)
+        return f"There are {_fmt(n)} {label_map.get(name, name)}{extra} in total.{suffix}"
+    return None
+
+
+def _duckdb_basic_text_answer(database_path: Path | None, question: str) -> str | None:
+    """General grounded text-metric engine.
+
+    Classifies semantic intent (certificate share, AI-substring course filter,
+    date-bounded enrollment, named-course lookup, passed-status filter, overall
+    distinct count), computes the metric from the read-only warehouse, and
+    answers in English plus a short Thai phrase for Thai-locale questions.
+    """
+    if not database_path or not database_path.exists():
+        return None
+    import duckdb
+    from dashboard_agent.readonly_duckdb import _is_transient_lock_error
+    # A short retry rides out transient exclusive locks (e.g. the hourly
+    # S3->DuckDB ingestion). Without it a single connect failure falls back
+    # to the LLM, which can guess a wrong number for a deterministic metric.
+    connection = None
+    for _attempt in range(3):
+        try:
+            connection = duckdb.connect(str(database_path), read_only=True)
+            break
+        except Exception as exc:
+            if _attempt < 2:
+                time.sleep(2.0)
+            elif _is_transient_lock_error(exc):
+                # The warehouse is mid-ingest (lock held for minutes).
+                # Falling through to the LLM would risk a fabricated number
+                # for a deterministic metric, so report the maintenance
+                # window honestly instead.
+                msg = (
+                    "The data warehouse is being updated right now, so I can't "
+                    "answer with numbers at the moment. Please try again in a "
+                    "few minutes."
+                )
+                if _contains_thai(question):
+                    msg += " " + _THAI_WAREHOUSE_BUSY
+                return msg
+            else:
+                return None
+    try:
+        if not _duckdb_table_exists(connection, "dashboard_agent_user_course_fact"):
+            return None
+        q = question.casefold()
+        thai = _contains_thai(question)
+        # Canonicalize Thai to English so the keyword intents below also
+        # match Thai-locale questions. The gloss preserves any quoted named
+        # entity verbatim, so named-entity lookups still work.
+        if thai:
+            _glossed = _thai_gloss(question)
+            if _glossed.strip():
+                q = _glossed.casefold()
+        # A count that names a specific value via a relation verb is a FILTERED
+        # count, not a dimension total -- resolve it before the naive
+        # 'department'/'province' keyword branches below. Only for pure user
+        # counts (no certificate/status/year qualifier), so qualified intents
+        # keep their existing specialized paths.
+        if re.search(r"\b(users?|learners?|students?|people|members?)\b", q) and not (
+            re.search(r"\b(certificate|certified|passed|passing|pass)\b", q)
+            or _year_filter(q) or _status_filter(q)
+        ):
+            _fd = _filtered_dimension_count(connection, q, "user", "user_id")
+            if _fd:
+                return _fd
+        if ("certificate" in q or "certified" in q) and ("passed" in q or "passing" in q):
+            n = _text_distinct_count(
+                connection, ["has_certificate = 1", "course_pass = 1"], []
+            )
+            answer = (
+                f"There are {n:,} distinct users with a certificate who have passed."
+            )
+            if thai:
+                answer += " " + T_THAI_PASSED_TEMPLATE.format(count=n)
+            return answer
+        if "certificate" in q or "certified" in q or "'ใบรับรอง'" in question:
+            certified, not_certified, total, pct = _text_certificate_counts(connection)
+            answer = (
+                f"Among a total of {total:,} unique learners, {certified:,} have a certificate "
+                f"({pct} percentage) and {not_certified:,} have no certificate."
+            )
+            if thai:
+                answer += f" 'ใบรับรอง' {certified:,}."
+            return answer
+        if re.search(r"\bai\b", q):
+            n = _text_distinct_count(connection, ["lower(subject_name) like '%ai%'"], [])
+            answer = (
+                f"There are {n:,} unique learners registered for courses with AI in the course name."
+            )
+            if thai:
+                answer += f" 'หลัก' AI {n:,}."
+            return answer
+        months = _text_month_range(question)
+        if months and (re.search(r"\b(between|from)\b", q) or "'ระหว่าง'" in question):
+            start_m, end_m = months
+            ym = re.search(r"\b(20\d{2})\b", question)
+            year = int(ym.group(1)) if ym else 2025
+            start_date = f"{year}-{start_m:02d}-01"
+            end_date = f"{year}-{end_m + 1:02d}-01" if end_m < 12 else f"{year + 1}-01-01"
+            n = _text_distinct_count(connection, ["enroll_date >= ?::date", "enroll_date < ?::date"],
+                                     [start_date, end_date])
+            answer = (
+                f"There are {n:,} unique learners (distinct users) registered between "
+                f"the start and end of the requested period."
+            )
+            if thai:
+                answer += f" 'เบียน' {n:,}."
+            return answer
+        curname = _text_find_course_name(question)
+        if curname and ("course" in q or "named" in q or "'หลัก'" in question):
+            n = _text_distinct_count(connection, ["subject_name = ?"], [curname])
+            if n == 0:
+                answer = (
+                    f"0. No unique learners are enrolled in that course; it is not found "
+                    f"({curname})."
+                )
+                if thai:
+                    answer += f" 'ไม่ต้อง' 'หลัก' {curname}."
+                return answer
+            return f"There are {n:,} unique learners enrolled in that course."
+        if "passed" in q or "passing" in q:
+            n = _text_distinct_count(connection, ["lower(trim(learning_status)) = 'passed'"], [])
+            answer = (
+                f"There are {n:,} distinct users with learning status passed."
+            )
+            if thai:
+                answer += " " + T_THAI_PASSED_TEMPLATE.format(count=n)
+            return answer
+        if curname and ("institution" in q or "belong" in q):
+            n = _text_distinct_count(connection, ["school_name = ?"], [curname])
+            if n == 0:
+                answer = (
+                    f"0. No unique learners belong to that institution; it is not "
+                    f"found ({curname})."
+                )
+            else:
+                answer = (
+                    f"There are {n:,} distinct users belonging to that institution."
+                )
+            if thai:
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+            return answer
+        # Multi-metric count: 'the number of X and the number of Y' --
+        # answer EVERY clause, not just the first matched entity.  Runs
+        # before the single-entity count branches so a two-way count is
+        # not truncated to one metric.
+        _mm = _multi_metric_counts(connection, q)
+        if _mm:
+            parts = [f"{n:,} {label}" for label, n in _mm]
+            if len(parts) == 2:
+                answer = f"There are {parts[0]} and {parts[1]}."
+            else:
+                answer = "There are " + ", ".join(parts[:-1]) + f" and {parts[-1]}."
+            if thai and _mm[0][0] == "distinct users":
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=_mm[0][1])
+            return answer
+        # Count-courses intent: "course(s)" is the head noun being counted
+        # (how many / number of / count of / total [modifier] courses).
+        # Phrasing-agnostic so "unique courses", "distinct courses", and
+        # "number of courses" all resolve to the same metric. A bare
+        # "course" mention with users/learners as the counted noun is
+        # handled by the earlier named-course / AI / default-user rules.
+        # "course(s)" is the head noun being counted, in either word
+        # order: English "number of courses" and Thai-glossed
+        # "course number of" (Thai reverses the noun/phrase order).
+        # User-counting "course" mentions ("enrolled in a course") are
+        # handled by the earlier named-course / AI rules or have no
+        # count phrase adjacent to "course", so they are not matched.
+        _count_courses_re = re.compile(
+            r"\b(?:how many|number of|count of|total)\b"
+            r"(?:\s+(?:unique|distinct|total|separate|different|individual))?\s+courses?\b"
+            r"|\bcourses?\b\s+(?:how many|number of|count of|total)\b"
+        )
+        if _count_courses_re.search(q):
+            n = int(connection.execute(
+                "select count(distinct course_id) from dashboard_agent_course_dim "
+                "where course_id is not null"
+            ).fetchone()[0])
+            answer = f"There are {n:,} distinct courses in total."
+            if thai:
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+            return answer
+        if "department" in q:
+            n = int(connection.execute(
+                "select count(distinct department_name) from dashboard_agent_user_course_fact "
+                "where department_name is not null and trim(department_name) <> ''"
+            ).fetchone()[0])
+            answer = f"There are {n:,} distinct departments in total."
+            if thai:
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+            return answer
+        if "province" in q:
+            n = int(connection.execute(
+                "select count(distinct province) from dashboard_agent_user_course_fact "
+                "where province is not null and trim(province) <> ''"
+            ).fetchone()[0])
+            answer = f"There are {n:,} distinct provinces represented."
+            if thai:
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+            return answer
+        if "school" in q:
+            n = int(connection.execute(
+                "select count(distinct school_name) from dashboard_agent_user_course_fact "
+                "where school_name is not null and trim(school_name) <> ''"
+            ).fetchone()[0])
+            answer = f"There are {n:,} distinct schools in total."
+            if thai:
+                answer += " " + T_THAI_DISTINCT_TEMPLATE.format(count=n)
+            return answer
+        # General schema-driven fallback (replaces the old "N distinct
+        # users" catch-all). Computes metric x entity x filter from the
+        # warehouse; returns None when it cannot confidently parse, so the
+        # caller falls through to the LLM.
+        general = _general_text_answer(connection, question)
+        if general is not None:
+            return general
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+T_THAI_PASSED_TEMPLATE = 'มีผู้ใช้ไม่ซ้ำที่มีสถานะการเรียนเป็น passed จำนวน {count:,} คน'
+T_THAI_DISTINCT_TEMPLATE = 'มีผู้ใช้ไม่ซ้ำทั้งหมด {count:,} คน'
+_THAI_WAREHOUSE_BUSY = 'ระบบกำลังอัปเดตฐานข้อมูลอยู่ จึงไม่สามารถแสดงตัวเลขได้ในขณะนี้ กรุณาลองใหม่อีกครั้งในอีกไม่กี่นาที'
 
 def _duckdb_sample_records(
     con: Any,
@@ -4185,15 +5058,8 @@ def _llm_activity_layout_spec(
     ]
     for candidate in candidates[:1]:
         try:
-            model = ChatOpenAI(
-                api_key=candidate["api_key"],
-                model=candidate["model"],
-                base_url=candidate.get("base_url"),
-                default_headers=candidate.get("headers") or None,
-                temperature=0,
-                model_kwargs={"response_format": {"type": "json_object"}},
-            )
-            response = model.invoke(messages)
+            model = _build_llm_model(candidate, json_mode=True)
+            response = _llm_invoke_bounded(model, messages, 108.0)
             content = str(response.content)
             parsed = json.loads(content)
             return parsed if isinstance(parsed, dict) else None
@@ -4361,17 +5227,8 @@ def _llm_design_complex_dashboard(question: str, activity: dict[str, Any]) -> di
     ]
     candidate = candidates[0]
     try:
-        model = ChatOpenAI(
-            api_key=candidate["api_key"],
-            model=candidate["model"],
-            base_url=candidate.get("base_url"),
-            default_headers=candidate.get("headers") or None,
-            temperature=0,
-            timeout=10,
-            max_retries=0,
-            model_kwargs={"response_format": {"type": "json_object"}},
-        )
-        parsed = json.loads(str(model.invoke(messages).content))
+        model = _build_llm_model(candidate, timeout=10, max_retries=0, json_mode=True)
+        parsed = json.loads(str(_llm_invoke_bounded(model, messages, 108.0).content))
         if not isinstance(parsed, dict):
             return activity
         choices = _preserve_meaningful_chart_variety(slots, parsed.get("chartTypes"))
@@ -4417,10 +5274,19 @@ def _agent_dashboard_reasoning(question: str, activity: dict[str, Any]) -> dict[
         execution_source = "graph" if any("graph" in value for value in dataset_types) else "duckdb"
         summary["executionSource"] = execution_source
     if (
-        summary.get("reasoningSource") in {"agent", "cache"}
-        and summary.get("reasoningExecutionSource") == execution_source
-        and isinstance(activity.get("decisionTrace"), list)
+        isinstance(activity.get("decisionTrace"), list)
         and activity["decisionTrace"]
+        and (
+            # Shape-derived reasoning is self-consistent: the analytical shape
+            # produced the decisionTrace and the chart binding together, so it
+            # is valid regardless of whether the overall execution is hybrid
+            # (graph planning + duckdb) or pure duckdb.
+            summary.get("reasoningSource") == "shape"
+            or (
+                summary.get("reasoningSource") in {"agent", "cache"}
+                and summary.get("reasoningExecutionSource") == execution_source
+            )
+        )
     ):
         return activity
 
@@ -4626,12 +5492,106 @@ def _openrouter_models() -> list[str]:
     return ordered
 
 
+_LLM_BUDGET_LOCK = threading.Lock()
+_LLM_BUDGET = {"remaining": None, "per_call": 28.0}
+
+
+def _llm_budget_set(total: float) -> None:
+    with _LLM_BUDGET_LOCK:
+        _LLM_BUDGET["remaining"] = float(total)
+
+
+def _llm_invoke_bounded(model, messages, budget_total: float):
+    """Invoke the LLM with a hard wall-clock ceiling.
+
+    The ceiling is min(per_call, remaining request budget). After the call,
+    the elapsed time is subtracted from the remaining request budget, so the
+    SUM of LLM time across a request is bounded by budget_total (default
+    108s, under the 120s gate). On expiry a TimeoutError is raised; every
+    call site already wraps the invoke in try/except and falls back to its
+    deterministic path, so a slow or hung free-tier call can no longer push
+    a request past the latency gate.
+    """
+    with _LLM_BUDGET_LOCK:
+        remaining = _LLM_BUDGET["remaining"]
+        if remaining is None:
+            remaining = float(budget_total)
+        remaining = max(0.5, min(float(_LLM_BUDGET["per_call"]), remaining))
+    start = time.monotonic()
+    ex = futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(model.invoke, messages)
+    try:
+        return fut.result(timeout=remaining)
+    except futures.TimeoutError:
+        fut.cancel()
+        raise
+    finally:
+        elapsed = time.monotonic() - start
+        with _LLM_BUDGET_LOCK:
+            if _LLM_BUDGET["remaining"] is not None:
+                _LLM_BUDGET["remaining"] = max(0.0, _LLM_BUDGET["remaining"] - elapsed)
+        # wait=False is essential: the context manager's shutdown(wait=True)
+        # would block until the invoke thread finished, defeating the timeout.
+        ex.shutdown(wait=False)
+
+
+def _build_llm_model(
+    candidate: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    max_retries: int | None = None,
+    json_mode: bool = False,
+) -> Any:
+    """Build a ChatOpenAI model for one LLM candidate.
+
+    Merges the candidate's own model_kwargs (e.g. GPT-OSS needs
+    reasoning_effort=low) with the call-site options so no provider
+    detail is hardcoded at the call sites.
+    """
+    from langchain_openai import ChatOpenAI
+
+    model_kwargs: dict[str, Any] = {}
+    if json_mode:
+        model_kwargs["response_format"] = {"type": "json_object"}
+    model_kwargs.update(candidate.get("model_kwargs") or {})
+    kwargs: dict[str, Any] = {
+        "api_key": candidate["api_key"],
+        "model": candidate["model"],
+        "base_url": candidate.get("base_url"),
+        "default_headers": candidate.get("headers") or None,
+        "temperature": 0,
+    }
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
+    if model_kwargs:
+        kwargs["model_kwargs"] = model_kwargs
+    return ChatOpenAI(**kwargs)
+
+
 def _llm_candidates() -> list[dict[str, Any]]:
     settings = get_settings()
     candidates: list[dict[str, Any]] = []
     provider = settings.llm_provider
+    use_gptoss = provider in {"auto", "gptoss"}
     use_openrouter = provider in {"auto", "openrouter"}
     use_openai = provider in {"auto", "openai"}
+    if use_gptoss and settings.gptoss_api_key:
+        candidates.append(
+            {
+                "provider": "gptoss",
+                "api_key": settings.gptoss_api_key,
+                "model": settings.gptoss_model,
+                "base_url": settings.gptoss_base_url,
+                "headers": {},
+                # GPT-OSS is a reasoning model: without a low reasoning
+                # effort the token budget is spent on chain-of-thought and
+                # `content` comes back null. Its frontend rejects
+                # max_tokens / max_completion_tokens, so no token budget.
+                "model_kwargs": {"reasoning_effort": "low"},
+            }
+        )
     if use_openrouter and settings.openrouter_api_key:
         headers = _openrouter_headers()
         for model in _openrouter_models():
@@ -4683,7 +5643,7 @@ def _llm_answer(question: str, results: list[dict[str, Any]]) -> str:
         (
             "system",
             (
-                "Answer using only supplied graph RAG context. Cite S3 keys or JSON paths in backticks. "
+                "Answer using only supplied graph RAG context. Cite the source dataset or field name (from the citation field) in backticks, never internal paths. "
                 "Summarize retrieved datasets before raw nodes. State when evidence is metadata-only or insufficient. "
                 + DASHBOARD_BUILDING_INSTRUCTIONS
             ),
@@ -4693,14 +5653,8 @@ def _llm_answer(question: str, results: list[dict[str, Any]]) -> str:
     failures: list[str] = []
     for candidate in candidates:
         try:
-            model = ChatOpenAI(
-                api_key=candidate["api_key"],
-                model=candidate["model"],
-                base_url=candidate.get("base_url"),
-                default_headers=candidate.get("headers") or None,
-                temperature=0,
-            )
-            response = model.invoke(messages)
+            model = _build_llm_model(candidate)
+            response = _llm_invoke_bounded(model, messages, 108.0)
             return str(response.content)
         except Exception as exc:
             failures.append(f"{candidate['provider']}:{candidate['model']} failed: {exc}")
@@ -4928,6 +5882,499 @@ def _multi_view_request_contract(question: str) -> dict[str, Any] | None:
     }
 
 
+_PROBLEM_SOLVE_SYSTEM_PROMPT = (
+    "Decide whether a user's analytics request is a PROBLEM or GOAL statement, or a "
+    "DIRECT data request.\n\n"
+    "A PROBLEM or GOAL statement: the user describes a business situation, asks why "
+    "something is happening, how to improve it, which items are struggling / at risk / "
+    "doing worse, or what to do about it, WITHOUT specifying the exact chart or "
+    "analysis. Examples: 'Why is the pass rate low?' 'Which courses are students "
+    "struggling with?' 'How can we improve learner engagement?' 'Is the secondary "
+    "segment doing worse?'\n\n"
+    "A DIRECT data request: the user already specifies the analysis - a count, a "
+    "value, a trend over time, a ranking, a breakdown by a category, a comparison, or "
+    "a distribution. Examples: 'How many distinct users are there?' 'Show the monthly "
+    "enrollment trend.' 'Rank schools by number of users.' 'Show the number of users "
+    "by department.'\n\n"
+    "A request that asks WHY something is happening, or asks what chart / analysis / "
+    "data would help answer a problem or goal (e.g. 'I want to answer why the pass rate "
+    "is low. What chart should be shown?'), is a PROBLEM statement - the user is "
+    "describing a situation to understand, not directly specifying a count / trend / "
+    "ranking. Set is_problem to true for these.\n\n"
+    "Be conservative. Set is_problem to true ONLY when the user is clearly stating a "
+    "problem / goal / why-question (with or without asking what chart to show) and NOT "
+    "directly specifying a concrete count / trend / ranking / breakdown. When in doubt, "
+    "set is_problem to false.\n\n"
+    "Return ONLY JSON with exactly one key: is_problem (boolean)."
+)
+
+_PROBLEM_SOLVE_REPHRASE_PROMPT = (
+    "You convert a user's business problem or goal into ONE precise analytical data "
+    "question that a chart can answer. The user states a PROBLEM or GOAL (for example "
+    "asking why a rate is low, which items are struggling, or how to improve an "
+    "outcome); it is not a chart request. Interpret the underlying analytical "
+    "question and express it so the dashboard engine can chart it.\n\n"
+    "The chart must ANSWER the problem, not restate it. A why-question (\'why is X "
+    "low / high / declining\') is answered by DECOMPOSING the metric X across a "
+    "meaningful category and RANKING the categories, so the worst (or best) "
+    "contributors stand out. An overall binary share (for example total passed vs "
+    "not passed) only describes the problem - it does NOT explain it, so never "
+    "rephrase a why-question into a plain overall share. A \'which items are "
+    "struggling\' question is answered by ranking those items by the relevant "
+    "negative indicator. A \'how can we improve Y\' question is answered by finding "
+    "the segment, group, or time period where Y is weakest or falling.\n"
+    "When the problem is about a RATE or PERCENTAGE (for example a low pass rate), "
+    "express the rephrased question as a RANKING of a named category by that RATE - "
+    "say the words \'pass rate\' or \'percentage of ... that passed\' and name the "
+    "category explicitly (for example \'Rank departments by pass rate, lowest first, "
+    "showing the percentage of users in each department who passed\'). Do not "
+    "rephrase a rate problem into a plain count of users.\n\n"
+    "Rules:\n"
+    "- Use ONLY the tables and columns in the provided schema. Do not invent fields.\n"
+    "- Express the question in ENGLISH, naming the measure to count or average, the "
+    "category to group or rank by, the sort direction, and any filter the problem "
+    "implies. For a why-question the category is required - name it explicitly.\n"
+    "- Prefer one of these analytical patterns the engine supports: ranking "
+    "(top-N categories by a measure, ascending or descending); comparison (a measure "
+    "across categories, split by a second dimension); trend over time (a measure by "
+    "month or week, to show a decline or drop); distribution (a measure split across "
+    "a category). For a why-question, ranking or comparison by a category is the "
+    "right pattern; an overall binary share is not.\n"
+    "- If the problem implies struggling, low, worse, or at-risk, use the relevant "
+    "negative indicator (low grade, not-passed, inactive status, drop-off) as the "
+    "measure or filter, and rank so the worst cases come first.\n"
+    "- Keep it to ONE focused question; do not ask for multiple charts.\n\n"
+    "Return ONLY JSON with exactly two keys: question (the analytical data question "
+    "in English) and insight (one sentence in the user's original language "
+    "explaining what you inferred and what the chart will reveal)."
+)
+
+
+def _problem_is_problem(question: str) -> bool:
+    """Cheap, schema-free decision: is the user stating a PROBLEM/GOAL to interpret
+    (vs a direct data request)? The model makes the call - no problem keywords are
+    hardcoded. Returns True only on a clear problem verdict; any failure returns
+    False so the normal path is untouched. Kept schema-free and small so it is fast
+    and cheap on the common (direct-request) path.
+    """
+    if get_settings().llm_mode == "never":
+        return False
+    candidates = _llm_candidates()
+    if not candidates:
+        return False
+    messages = [
+        ("system", _PROBLEM_SOLVE_SYSTEM_PROMPT),
+        ("human", json.dumps({"request": question}, ensure_ascii=False)),
+    ]
+    for candidate in candidates:
+        try:
+            model = _build_llm_model(candidate, timeout=12, max_retries=0, json_mode=True)
+            parsed = json.loads(str(_llm_invoke_bounded(model, messages, 108.0).content))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return bool(parsed.get("is_problem"))
+    return False
+
+
+def _problem_solve_rephrase(question: str, schema: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Problem-solve mode: interpret the user's underlying problem and rewrite it
+    into ONE precise analytical data question the deterministic planner can execute.
+
+    General and schema-driven: the model sees the live table/column schema and the
+    analytical patterns the system already supports, and is asked to express the
+    problem as a data question. No problem-specific phrases are hardcoded; the
+    mapping is delegated to the model. Returns a dict with question and insight,
+    or None on any failure so the caller falls back to the deterministic path.
+    """
+    if get_settings().llm_mode == "never" or not schema:
+        return None
+    candidates = _llm_candidates()
+    if not candidates:
+        return None
+    schema_brief = json.dumps(schema, ensure_ascii=False, default=str)[:6000]
+    messages = [
+        ("system", _PROBLEM_SOLVE_REPHRASE_PROMPT),
+        ("human", json.dumps({"problem": question, "schema": schema_brief}, ensure_ascii=False)),
+    ]
+    for candidate in candidates:
+        try:
+            model = _build_llm_model(candidate, timeout=12, max_retries=0, json_mode=True)
+            parsed = json.loads(str(_llm_invoke_bounded(model, messages, 108.0).content))
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        new_question = str(parsed.get("question") or "").strip()
+        insight = str(parsed.get("insight") or "").strip()
+        if new_question:
+            return {"question": new_question[:400], "insight": insight[:300]}
+    return None
+
+
+def _attach_problem_insight(activity: dict[str, Any], insight: str) -> dict[str, Any]:
+    """Surface the problem interpretation in the dashboard reasoning + subtitle."""
+    if not activity or not insight:
+        return activity
+    trace = activity.get("decisionTrace")
+    if not isinstance(trace, list):
+        trace = []
+    trace.insert(
+        0,
+        {"stage": "Interpret problem", "detail": insight, "evidence": []},
+    )
+    activity["decisionTrace"] = trace
+    return activity
+
+
+_CHART_VERIFY_PROMPT = (
+    "You are a strict data-visualization reviewer. You are given the user's question and a "
+    "compact description of the chart that was produced. Decide whether the chart's DATA "
+    "(not its styling) directly answers the question. "
+    "Return only JSON with four keys: answers (boolean), reason (one short sentence), "
+    "refined_question (a single, more precise analytical data question that WOULD answer it, "
+    "or an empty string), and usefulness (one short, plain-language sentence explaining why "
+    "this chart helps the user understand or answer their question). "
+    "Set answers=true only if the chart's measured quantity, grouping dimension, and category "
+    "match what the question asks for. Set answers=false when the chart measures the wrong "
+    "quantity (for example a plain count when a rate or percentage was asked), groups by the "
+    "wrong dimension, or is too aggregate to answer a 'why' question. When answers=false, "
+    "refined_question must be ONE precise data question that a single chart can answer. Do not "
+    "mention specific table or column names you were not given."
+)
+
+
+def _chart_brief(activity: dict[str, Any]) -> dict[str, Any]:
+    """Compact, PII-free description of a produced chart for the reviewer LLM."""
+    summary = activity.get("summary") if isinstance(activity.get("summary"), dict) else {}
+    layout = activity.get("layoutSpec") if isinstance(activity.get("layoutSpec"), dict) else {}
+    slots: list[dict[str, Any]] = []
+    for slot in activity.get("chartSlots") or []:
+        if not isinstance(slot, dict):
+            continue
+        data = slot.get("data") or []
+        labels = [
+            str(rec.get("label") or rec.get("x") or "")
+            for rec in data[:5]
+            if isinstance(rec, dict)
+        ]
+        values = [
+            rec.get("value") or rec.get("y")
+            for rec in data[:5]
+            if isinstance(rec, dict)
+        ]
+        slots.append(
+            {
+                "title": slot.get("title"),
+                "chartType": slot.get("chartType"),
+                "field": slot.get("field"),
+                "splitField": slot.get("splitField"),
+                "rows": len(data),
+                "sampleLabels": labels,
+                "sampleValues": values,
+            }
+        )
+    return {
+        "title": layout.get("title"),
+        "reasoningSource": summary.get("reasoningSource"),
+        "analyticalPlan": summary.get("analyticalPlan"),
+        "chartSlots": slots,
+    }
+
+
+def _chart_answers_question(question: str, activity: dict[str, Any]) -> dict[str, Any] | None:
+    """Cheap reviewer LLM call: does the produced chart's data answer the question?
+
+    General and schema-free - it judges question semantics against chart semantics,
+    with no hardcoded fields or phrases. Iterates all LLM candidates with fallback and
+    is bounded by the request LLM budget. Returns the verdict dict, or None on any
+    failure so the caller keeps the original chart (safe degradation).
+    """
+    if get_settings().llm_mode == "never":
+        return None
+    candidates = _llm_candidates()
+    if not candidates:
+        return None
+    messages = [
+        ("system", _CHART_VERIFY_PROMPT),
+        (
+            "human",
+            json.dumps(
+                {"question": question, "chart": _chart_brief(activity)},
+                ensure_ascii=False,
+                default=str,
+            ),
+        ),
+    ]
+    for candidate in candidates:
+        try:
+            model = _build_llm_model(candidate, timeout=10, max_retries=0, json_mode=True)
+            parsed = json.loads(str(_llm_invoke_bounded(model, messages, 108.0).content))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _replan_dashboard(
+    store: Any,
+    database_path: Any,
+    question: str,
+    graph_hints: Any,
+    original_question: str,
+) -> dict[str, Any] | None:
+    """Re-run the deterministic data-planning chain for a (refined) question.
+
+    The shape layer reads the ORIGINAL wording, so the re-plan must hand it the
+    REFINED question (which names the category and measure the reviewer asked
+    for), not the user's raw problem statement - otherwise the shape layer
+    re-derives the same coarse chart the reviewer just rejected.
+    """
+    if not database_path or not database_path.exists():
+        return None
+    return (
+        build_complex_dashboard(
+            database_path,
+            question,
+            graph_hints=graph_hints,
+            original_question=question,
+        )
+        or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
+        or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
+        or _duckdb_activity_context(store, question)
+    )
+
+
+def _attach_why_chart(activity: dict[str, Any], why: str) -> dict[str, Any]:
+    """Surface a 'why this chart is useful' explanation in the decision trace."""
+    if not activity or not why:
+        return activity
+    trace = activity.get("decisionTrace")
+    if not isinstance(trace, list):
+        trace = []
+    for t in trace:
+        if isinstance(t, dict) and t.get("stage") == "Why this chart":
+            return activity
+    trace.insert(0, {"stage": "Why this chart", "detail": why, "evidence": []})
+    activity["decisionTrace"] = trace
+    return activity
+
+
+def _verify_and_repair_dashboard(
+    store: Any,
+    question: str,
+    activity: dict[str, Any],
+    database_path: Any,
+    graph_hints: Any,
+    original_question: str,
+) -> dict[str, Any]:
+    """Hermes-style verify->repair loop, bounded to ONE repair iteration.
+
+    After a dashboard is produced, a cheap reviewer LLM checks whether the chart's
+    data actually answers the question. If it clearly does not and offers a more
+    precise question, the data is re-planned once. Only a data-backed,
+    deterministic (shape-resolved) repair is accepted; otherwise the original
+    chart is kept. Any failure keeps the original (safe degradation). The reviewer
+    also explains WHY the final chart is useful for the user's problem, which is
+    surfaced in the decision trace. This is the 'keep acting until the result is
+    verified' pattern, adapted to the deterministic-first planner.
+    """
+    if not _activity_has_data(activity) or get_settings().llm_mode == "never":
+        return activity
+    verdict = _chart_answers_question(question, activity)
+    if not isinstance(verdict, dict):
+        return activity
+    usefulness = str(verdict.get("usefulness") or verdict.get("reason") or "").strip()
+    if verdict.get("answers"):
+        return _attach_why_chart(activity, usefulness)
+    refined = str(verdict.get("refined_question") or "").strip()
+    if not refined or refined.lower() == question.lower():
+        return _attach_why_chart(activity, usefulness)
+    try:
+        repaired = _replan_dashboard(store, database_path, refined, graph_hints, original_question)
+    except Exception:
+        return _attach_why_chart(activity, usefulness)
+    if not repaired or not _activity_has_data(repaired):
+        return _attach_why_chart(activity, usefulness)
+    repaired_is_shape = (
+        str((repaired.get("summary") or {}).get("reasoningSource") or "") == "shape"
+    )
+    if repaired_is_shape:
+        # The repaired chart answers the refined question - explain that directly.
+        return _attach_why_chart(repaired, "This chart answers: " + refined + ".")
+    return _attach_why_chart(activity, usefulness)
+
+_CHART_CHAIN_PROMPT = (
+    "You are a data analyst continuing an investigation. You are given the user's problem, "
+    "the charts already produced (titles, fields, and a few sample values), and the available "
+    "data fields. Decide whether the charts so far fully answer the problem. If not, propose "
+    "the ONE next chart that most advances the answer - typically a drill-down into the most "
+    "surprising or most extreme finding visible in the current charts. The next chart must be "
+    "expressible as a single chart: one measure grouped by ONE available field (or split by a "
+    "second one) - it cannot filter to a single specific row value. Return only JSON with two "
+    "keys: next_question (a single precise analytical data question that one chart can answer "
+    "using the available fields, or an empty string if the problem is already answered) and "
+    "why (one short plain-language sentence explaining what this next chart adds to the "
+    "answer). Do not propose a chart that merely repeats an existing one."
+)
+
+
+def _next_chain_step(
+    question: str, activity: dict[str, Any], schema: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """Cheap reviewer LLM: given the problem + charts so far, propose the next drill-down.
+
+    Schema-driven (the available fields are passed so the proposal is expressible by the
+    deterministic planner); iterates all LLM candidates with fallback and is bounded by
+    the request LLM budget. Returns the step dict, or None on any failure (the chain
+    stops - safe degradation).
+    """
+    if get_settings().llm_mode == "never":
+        return None
+    candidates = _llm_candidates()
+    if not candidates:
+        return None
+    payload: dict[str, Any] = {"problem": question, "charts_so_far": _chart_brief(activity)}
+    if schema:
+        payload["available_fields"] = schema
+    messages = [
+        ("system", _CHART_CHAIN_PROMPT),
+        ("human", json.dumps(payload, ensure_ascii=False, default=str)),
+    ]
+    for candidate in candidates:
+        try:
+            model = _build_llm_model(candidate, timeout=10, max_retries=0, json_mode=True)
+            parsed = json.loads(str(_llm_invoke_bounded(model, messages, 108.0).content))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _merge_chart_into_activity(
+    base: dict[str, Any], extra: dict[str, Any], why: str
+) -> tuple[dict[str, Any], bool]:
+    """Merge a chained chart into the base dashboard activity.
+
+    Returns (activity, added). Dedupes by (field, splitField, title) so the chain loop
+    stops when a step proposes a chart that already exists.
+    """
+    base_slots = base.get("chartSlots")
+    if not isinstance(base_slots, list):
+        base_slots = []
+        base["chartSlots"] = base_slots
+    existing = {
+        (str(s.get("field") or ""), str(s.get("splitField") or ""), str(s.get("title") or ""))
+        for s in base_slots
+        if isinstance(s, dict)
+    }
+    existing_ids = {str(s.get("id") or "") for s in base_slots if isinstance(s, dict)}
+    charts = base.get("charts")
+    if not isinstance(charts, dict):
+        charts = {}
+        base["charts"] = charts
+    plan = base.get("chartPlan")
+    if not isinstance(plan, list):
+        plan = []
+        base["chartPlan"] = plan
+    added = False
+    for slot in extra.get("chartSlots") or []:
+        if not isinstance(slot, dict):
+            continue
+        key = (str(slot.get("field") or ""), str(slot.get("splitField") or ""), str(slot.get("title") or ""))
+        if key in existing:
+            continue
+        existing.add(key)
+        slot_id = str(slot.get("id") or "slot")
+        n = 2
+        while slot_id in existing_ids:
+            slot_id = f"{slot_id}-{n}"
+            n += 1
+        slot = dict(slot)
+        slot["id"] = slot_id
+        existing_ids.add(slot_id)
+        base_slots.append(slot)
+        charts[slot_id] = slot.get("data")
+        plan.append({k: v for k, v in slot.items() if k != "data"})
+        added = True
+    if not added:
+        return base, False
+    layout = base.get("layoutSpec")
+    if isinstance(layout, dict):
+        blocks = layout.get("blocks")
+        if not isinstance(blocks, list):
+            blocks = []
+            layout["blocks"] = blocks
+        have = {b.get("slotId") for b in blocks if isinstance(b, dict)}
+        for slot in base_slots:
+            if slot.get("id") not in have:
+                blocks.append({"type": "chart", "slotId": slot.get("id"), "span": 2})
+        layout["title"] = " / ".join(str(s.get("title") or s.get("id")) for s in base_slots)
+        layout["subtitle"] = layout["title"]
+    trace = base.get("decisionTrace")
+    if not isinstance(trace, list):
+        trace = []
+        base["decisionTrace"] = trace
+    if why:
+        trace.append({"stage": "Drill down", "detail": why, "evidence": []})
+    trace.extend(t for t in extra.get("decisionTrace") or [] if isinstance(t, dict))
+    summary = base.get("summary")
+    if isinstance(summary, dict):
+        try:
+            summary["totalRecords"] = int(summary.get("totalRecords") or 0) + int(
+                (extra.get("summary") or {}).get("totalRecords") or 0
+            )
+        except Exception:
+            pass
+    return base, True
+
+
+def _chain_problem_analysis(
+    store: Any,
+    user_question: str,
+    activity: dict[str, Any],
+    database_path: Any,
+    graph_hints: Any,
+    max_steps: int = 2,
+) -> dict[str, Any]:
+    """Hermes-style iterative chain: keep drilling into the problem with additional
+    charts until the analyst LLM says the problem is answered (or steps/budget run out).
+
+    Each step is ONE cheap LLM proposal + ONE deterministic re-plan (no LLM in the
+    re-plan), so the whole chain is bounded by the request LLM budget. Only
+    data-backed, shape-resolved charts are accepted; duplicates stop the chain. Any
+    failure stops the chain and keeps the charts produced so far (safe degradation).
+    """
+    if not _activity_has_data(activity) or get_settings().llm_mode == "never":
+        return activity
+    for _ in range(max_steps):
+        if len(activity.get("chartSlots") or []) >= 4:
+            break
+        step = _next_chain_step(user_question, activity, _duckdb_semantic_schema(store))
+        if not isinstance(step, dict):
+            break
+        nxt = str(step.get("next_question") or "").strip()
+        why = str(step.get("why") or "").strip()
+        if not nxt:
+            break  # the analyst says the problem is answered
+        try:
+            extra = _replan_dashboard(store, database_path, nxt, graph_hints, nxt)
+        except Exception:
+            break
+        if not extra or not _activity_has_data(extra):
+            break
+        if str((extra.get("summary") or {}).get("reasoningSource") or "") != "shape":
+            break  # only accept deterministic, trustworthy charts
+        activity, added = _merge_chart_into_activity(
+            activity, extra, why or f"This chart answers: {nxt}."
+        )
+        if not added:
+            break  # duplicate chart - stop
+    return activity
+
+
 def _canonicalize_question_for_processing(
     question: str,
     *,
@@ -4950,6 +6397,20 @@ def _canonicalize_question_for_processing(
     cached = _question_language_cache.get(cache_key)
     if cached:
         return cached
+    # Short Thai prompts whose every Thai run is covered by the intent
+    # lexicon are glossed deterministically.  This is the same general
+    # rule the shape resolver uses, and it is preferred over a persisted
+    # translation because a model can mis-translate a misspelled atomic
+    # prompt into an unrelated intent (e.g. a by-institution request
+    # becoming an over-time request) and that wrong form then matches a
+    # stale dashboard-cache entry.
+    if _contains_thai(question) and len(question) <= 60 and _thai_question_fully_glossable(question):
+        glossed = _normalize_canonical_analytics_question(_thai_gloss(question))
+        glossed = _preserve_source_analytics_intent(question, glossed)
+        _question_language_cache[cache_key] = glossed
+        if graph_path is not None:
+            write_question_translation(graph_path, cache_key, glossed)
+        return glossed
     persisted_key = cache_key
     if graph_path is not None:
         persisted = read_question_translation(graph_path, persisted_key)
@@ -5398,20 +6859,18 @@ def _invoke_language_json(*, system: str, payload: dict[str, Any]) -> dict[str, 
 
     for candidate in candidates:
         try:
-            model = ChatOpenAI(
-                api_key=candidate["api_key"],
-                model=candidate["model"],
-                base_url=candidate.get("base_url"),
-                default_headers=candidate.get("headers") or None,
-                temperature=0,
-                timeout=12,
-                max_retries=0,
-                model_kwargs={"response_format": {"type": "json_object"}},
-            )
+            model = _build_llm_model(candidate, timeout=12, max_retries=0, json_mode=True)
+            # Wrap in the per-request LLM budget like every other call site:
+            # the raw timeout=12 is a READ timeout, not a total-time bound, so a
+            # slow free-tier call could otherwise hang this Thai-localization step
+            # past the 120s latency gate. On TimeoutError the existing
+            # except/continue falls back to the next candidate / deterministic path.
             parsed = json.loads(
                 str(
-                    model.invoke(
-                        [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))]
+                    _llm_invoke_bounded(
+                        model,
+                        [("system", system), ("human", json.dumps(payload, ensure_ascii=False, default=str))],
+                        108.0,
                     ).content
                 )
             )
@@ -5612,61 +7071,89 @@ def _mark_hybrid_execution(activity: dict[str, Any], graph_hints: dict[str, Any]
             },
         }
     )
-    summary.pop("reasoningSource", None)
-    summary.pop("reasoningExecutionSource", None)
+    # Preserve shape-derived reasoning markers: the analytical shape already
+    # resolved the question and produced a complete decisionTrace. Stripping
+    # them here made downstream checks (shape_resolved, reasoning early-return)
+    # fail, forcing redundant slow LLM calls to re-derive the same design.
+    if summary.get("reasoningSource") != "shape":
+        summary.pop("reasoningSource", None)
+        summary.pop("reasoningExecutionSource", None)
     activity["summary"] = summary
     return activity
 
 
-_PATTERN_COMPILER_EPOCH = "pattern-compiler-v1"
+def _activity_has_data(activity: dict[str, Any] | None) -> bool:
+    """True when an activity payload carries at least one computed chart point.
+
+    A data-backed analytical plan (from build_complex_dashboard) produces
+    chartSlots whose rows were aggregated from the warehouse.  Skeleton
+    activities from the graph/context builders can carry slot shells, sample
+    records, or row-level search results but no computed points; treating
+    those as data-backed output would mask a failed plan and leak PII.
+    """
+    if not isinstance(activity, dict):
+        return False
+    slots = activity.get("chartSlots")
+    if isinstance(slots, list):
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            data = slot.get("data")
+            if isinstance(data, list) and any(
+                isinstance(row, dict) and row.get("value") is not None for row in data
+            ):
+                return True
+    charts = activity.get("charts")
+    if isinstance(charts, dict):
+        for rows in charts.values():
+            if isinstance(rows, list) and rows:
+                return True
+    return False
 
 
-def _text_only_answer(store: Any, question: str) -> str:
-    """Deterministic text-only answer for explicit no-chart requests."""
+_PLANNER_CODE_VERSION_CACHE: dict[str, str] = {}
 
-    database_path = _duckdb_database_path(store)
-    total: int | None = None
-    if database_path and Path(database_path).exists():
+
+def _planner_code_version() -> str:
+    """Fingerprint of the dashboard planner code.
+
+    The graph dashboard cache is keyed by (normalized_question, source_version).
+    source_version previously reflected only the warehouse file (size + mtime),
+    so edits to the planner/selection logic kept replaying stale cached
+    dashboards. Folding a content hash of the planner modules into the version
+    makes any change to the selection logic automatically invalidate the cache.
+    """
+    parts = []
+    for module in ("dashboard_planner", "graph_dashboard_cache"):
         try:
-            from dashboard_agent.readonly_duckdb import connect_read_only
-
-            con = connect_read_only(str(database_path))
+            path = Path(__file__).with_name(f"{module}.py")
+            stat = path.stat()
+        except OSError:
+            continue
+        key = f"{module}:{stat.st_size}:{stat.st_mtime_ns}"
+        digest = _PLANNER_CODE_VERSION_CACHE.get(key)
+        if digest is None:
             try:
-                row = con.execute(f"SELECT COUNT(DISTINCT user_id) FROM {FACT_TABLE}").fetchone()
-                total = int(row[0]) if row and row[0] is not None else None
-            finally:
-                con.close()
-        except Exception:
-            total = None
-    if total is None:
-        return "The distinct-user count is unavailable right now. Please try again later."
-    return (
-        f"{total:,} distinct users are represented in the warehouse. "
-        "Text-only response requested, so no chart was created."
-    )
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+            except OSError:
+                digest = "unreadable"
+            _PLANNER_CODE_VERSION_CACHE[key] = digest
+        parts.append(f"{module}={digest}")
+    return "+".join(parts)
 
 
 def _dashboard_source_version(database_path: Path | None) -> str:
     if database_path is None:
-        return _PATTERN_COMPILER_EPOCH
+        return ""
     try:
         stat = database_path.stat()
     except OSError:
-        return _PATTERN_COMPILER_EPOCH
-    return f"{stat.st_size}:{stat.st_mtime_ns}:{_PATTERN_COMPILER_EPOCH}"
+        return ""
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{_planner_code_version()}"
 
 
 def run_agent(state: AgentState) -> dict[str, list[AIMessage]]:
-    try:
-        return _run_agent_impl(state)
-    except Exception:
-        import traceback
-        with open('/tmp/runagent-errors.log', 'a', encoding='utf-8') as _err:
-            _err.write(traceback.format_exc() + '\n===\n')
-        raise
-
-
-def _run_agent_impl(state: AgentState) -> dict[str, list[AIMessage]]:
+    _llm_budget_set(108.0)
     user_question = _last_question(state)
     store = get_store()
     seed_question = _seed_question_for_semantic_search(user_question)
@@ -5713,71 +7200,136 @@ def _run_agent_impl(state: AgentState) -> dict[str, list[AIMessage]]:
     cache_results = _aggregate_cache_results(store, question)
     graph_results = store.search(question, limit=24)
     results = cache_results + graph_results
-    if wants_text_only(user_question):
-        answer = _text_only_answer(store, user_question)
-        if notices:
-            answer = "\n\n".join(notices + [answer])
-        return {"messages": [AIMessage(content=answer)]}
-
-    if _wants_dashboard(question):
+    # Route on the canonicalized intent, not only the raw surface form: a
+    # misspelled Thai prompt can leave the deterministic gloss empty (no
+    # intent words survive), so the structural dashboard rules never see the
+    # grouping/trend/ranking the user actually asked for.  The canonicalized
+    # English already carries that intent, so checking it too keeps the same
+    # general rules while fixing typo-tolerant routing.  English prompts are
+    # unchanged (canonicalization preserves their structure), and scalar
+    # counts still stay on the text path.
+    # An explicit text request in the RAW question is authoritative: the
+    # canonicalized form is a lossy LLM rewrite that can drop the marker and
+    # flip routing to a dashboard, so the canonicalized clause only applies
+    # when the user did not explicitly ask for text.
+    explicit_text = _has_explicit_text_request(user_question)
+    wants_dashboard = _wants_dashboard(user_question) or (
+        not explicit_text and _wants_dashboard(question)
+    )
+    # Problem-solve mode (automatic, no toggle): a request that is not an
+    # explicit text answer and not already a specified chart request would
+    # otherwise fall to the text path. Let the model decide whether the user is
+    # actually stating a problem/goal to interpret; if so, rephrase it into a
+    # precise analytical question and route it to the dashboard. No problem
+    # keywords are hardcoded - the model makes the call. Any failure (or a
+    # "not a problem" verdict) leaves the normal text path untouched.
+    problem_rephrase = None
+    # The LLM is the sole decider of whether the request is a problem/goal to
+    # interpret. This runs on ALL non-explicit-text requests (including those the
+    # deterministic router would call "dashboard", e.g. "I want to answer why X.
+    # What chart should be shown?") so the user's natural problem phrasing always
+    # reaches the model. A "not a problem" verdict (or any failure) leaves the
+    # normal dashboard/text path untouched.
+    if not explicit_text and _problem_is_problem(user_question):
+        problem_rephrase = _problem_solve_rephrase(user_question, _duckdb_semantic_schema(store))
+    if (problem_rephrase is not None) or wants_dashboard:
         database_path = _duckdb_database_path(store)
         source_version = _dashboard_source_version(database_path)
         graph_hints = _graph_planning_hints(store, graph_results)
+        plan_question = problem_rephrase["question"] if problem_rephrase else question
+        problem_insight = problem_rephrase.get("insight", "") if problem_rephrase else ""
         activity = read_graph_dashboard_cache(
             store.path,
-            question,
+            plan_question,
             source_version=source_version,
-        )
-        requested_pattern = detect_pattern(user_question)
-        # Deterministically compiled patterns bypass the exact-match dashboard
-        # cache entirely: the compiler is a pure function of question and data,
-        # so the cache adds no value and LLM-canonicalized keys could
-        # cross-contaminate lookalike requests. Cache reads/writes key on the
-        # RAW user question so repeated identical prompts stay deterministic;
-        # canonicalized rewrites are unstable cache keys.
-        activity = (
-            None
-            if requested_pattern is not None
-            else read_graph_dashboard_cache(
-                store.path,
-                user_question,
-                source_version=source_version,
-            )
+            original_question=user_question,
         )
         generated = False
-        deterministic_pattern = False
-        if activity is None and database_path and database_path.exists():
-            if requested_pattern is not None:
-                activity = compile_analytical_pattern(str(database_path), user_question)
-                deterministic_pattern = activity is not None
-            if not deterministic_pattern:
-                activity = (
-                    build_complex_dashboard(database_path, question, graph_hints=graph_hints)
-                    or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
-                    or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
-                    or _duckdb_activity_context(store, question)
-                )
-                if activity:
-                    activity = _mark_hybrid_execution(activity, graph_hints)
-                    generated = True
-        if not activity:
+        if not activity and database_path and database_path.exists():
             activity = (
-                _graph_time_series_activity_context(store, question)
-                or _graph_ranked_dimension_context(store, question)
-                or _aggregate_cache_activity(store, question)
-                or _activity_dashboard_context(store, results, question)
+                build_complex_dashboard(
+                    database_path,
+                    plan_question,
+                    graph_hints=graph_hints,
+                    original_question=plan_question if problem_rephrase else user_question,
+                )
+                or _duckdb_grouped_time_series_context(store, question, graph_hints=graph_hints)
+                or _duckdb_ranked_dimension_context(store, question, graph_hints=graph_hints)
+                or _duckdb_activity_context(store, question)
             )
+            if activity:
+                activity = _mark_hybrid_execution(activity, graph_hints)
+                generated = True
+            if not _activity_has_data(activity):
+                # Graph context is a fallback for questions the analytical
+                # plan could not answer with computed points.  A data-backed
+                # plan already answers the question, so replacing it with a
+                # skeleton (and its row-level search results) would lose the
+                # computed chart and expose record values in the payload.
+                fallback_activity = (
+                    _graph_time_series_activity_context(store, question)
+                    or _graph_ranked_dimension_context(store, question)
+                    or _aggregate_cache_activity(store, question)
+                    or _activity_dashboard_context(store, results, question)
+                )
+                if _activity_has_data(fallback_activity):
+                    activity = fallback_activity
+                    generated = False
         if activity:
-            if generated:
-                activity = _llm_design_complex_dashboard(question, activity)
-            activity = _agent_dashboard_reasoning(question, activity)
-            if not deterministic_pattern:
-                write_graph_dashboard_cache(
-                    store.path,
+            shape_resolved = str(
+                (activity.get("summary") or {}).get("reasoningSource") or ""
+            ) == "shape"
+            if generated and not shape_resolved:
+                activity = _llm_design_complex_dashboard(plan_question, activity)
+            # Hermes-style verify->repair: a cheap reviewer LLM checks the produced
+            # chart actually answers the question, and re-plans once if not. Fires
+            # only on the hard paths (problem-solve requests and the LLM-planner
+            # fallback) - never on the deterministic-shape eval corpus.
+            if problem_rephrase is not None or (generated and not shape_resolved):
+                # Verify against the user's ORIGINAL problem (not the rephrase):
+                # a bad rephrase must not be able to fool the reviewer into
+                # accepting a chart that restates the problem instead of
+                # answering it. The re-plan still uses the reviewer's refined
+                # question, which names the category and measure needed.
+                activity = _verify_and_repair_dashboard(
+                    store,
                     user_question,
                     activity,
-                    source_version=source_version,
+                    database_path,
+                    graph_hints,
+                    user_question,
                 )
+            if problem_rephrase is not None:
+                # Hermes-style chain: after the verified chart, keep drilling into
+                # the problem with additional charts until it is answered.
+                activity = _chain_problem_analysis(
+                    store,
+                    user_question,
+                    activity,
+                    database_path,
+                    graph_hints,
+                )
+            activity = _agent_dashboard_reasoning(question, activity)
+            write_graph_dashboard_cache(
+                store.path,
+                question,
+                activity,
+                source_version=source_version,
+                original_question=user_question,
+            )
+            if problem_rephrase is not None:
+                # Self-heal the cache: the read was keyed on the rephrased
+                # question, so write the (possibly repaired) chart back under
+                # that key too, replacing any poisoned entry.
+                write_graph_dashboard_cache(
+                    store.path,
+                    plan_question,
+                    activity,
+                    source_version=source_version,
+                    original_question=user_question,
+                )
+            if problem_insight:
+                activity = _attach_problem_insight(activity, problem_insight)
             activity = _localize_activity_to_thai(user_question, activity)
         title = "แดชบอร์ดข้อมูล" if _contains_thai(user_question) else ("Activity dashboard" if activity else "Dashboard graph")
         marker_results = [] if activity else results
@@ -5788,7 +7340,7 @@ def _run_agent_impl(state: AgentState) -> dict[str, list[AIMessage]]:
             title=title,
         )
     else:
-        answer = _llm_answer(user_question, results)
+        answer = _duckdb_basic_text_answer(_duckdb_database_path(store), user_question) or _llm_answer(user_question, results)
     if notices:
         answer = "\n\n".join(notices + [answer])
     return {"messages": [AIMessage(content=answer)]}

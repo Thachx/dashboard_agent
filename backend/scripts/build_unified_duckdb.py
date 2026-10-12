@@ -51,6 +51,13 @@ def iter_input_files(data_dir: Path, include_sql: bool) -> Iterator[Path]:
             continue
         if suffix == '.sql' and not include_sql:
             continue
+        # Skip a nested duplicate: <dir>/<stem>/<stem>.<ext> is a byte-for-byte
+        # copy of its flat sibling <dir>/<stem>.<ext> (same name, one level up).
+        # Ingesting both would store every record twice under two source_path
+        # spellings. Keep the flat spelling as canonical.
+        parent = path.parent
+        if parent.name == path.stem and (parent / path.name).exists():
+            continue
         yield path
 
 

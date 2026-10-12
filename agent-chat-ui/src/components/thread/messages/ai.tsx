@@ -498,8 +498,8 @@ export function AssistantMessage({
                   style={{ whiteSpace: "nowrap", wordBreak: "keep-all" }}
                 >
                   {thoughtDurationLabel
-                    ? `Thought for ${thoughtDurationLabel}`
-                    : "Thought for --"}
+                    ? `ความคิดสำหรับ ${thoughtDurationLabel}`
+                    : "ความคิดสำหรับ --"}
                 </button>
                 {showDetailPanel && (
                   <div className="mt-1 space-y-3 rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground/80 max-h-96 overflow-y-auto w-full min-w-0">

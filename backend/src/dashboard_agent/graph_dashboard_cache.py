@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-CACHE_VERSION = 24
+CACHE_VERSION = 27
 MAX_CACHE_ENTRIES = 100
 CACHE_LOCK = threading.Lock()
 LANGUAGE_CACHE_LOCK = threading.Lock()
@@ -39,6 +39,7 @@ def read_graph_dashboard_cache(
     question: str,
     *,
     source_version: str = "",
+    original_question: str | None = None,
 ) -> dict[str, Any]:
     path = _cache_path(Path(graph_path))
     if not path.exists():
@@ -54,7 +55,7 @@ def read_graph_dashboard_cache(
         return {}
     if not _normalized_is_cacheable(question):
         return {}
-    normalized = _normalize_question(question)
+    normalized = _cache_key(question, original_question)
     for entry in entries:
         if not isinstance(entry, dict) or not isinstance(entry.get("activity"), dict):
             continue
@@ -74,16 +75,18 @@ def write_graph_dashboard_cache(
     activity: dict[str, Any],
     *,
     source_version: str = "",
+    original_question: str | None = None,
 ) -> bool:
     if not _is_duckdb_activity(activity):
         return False
     if not _normalized_is_cacheable(question):
         return False
     path = _cache_path(Path(graph_path))
+    normalized = _cache_key(question, original_question)
     entry = {
-        "id": hashlib.sha256(_normalize_question(question).encode("utf-8")).hexdigest()[:24],
+        "id": hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24],
         "question": question.strip(),
-        "normalized_question": _normalize_question(question),
+        "normalized_question": normalized,
         "semantic_terms": sorted(_semantic_terms(question)),
         "intent": _intent_shape(question),
         "source_version": source_version,
@@ -229,6 +232,76 @@ def _normalized_is_cacheable(question: str) -> bool:
 
 def _normalize_question(question: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", question.lower()))
+
+
+def _explicit_top_n(question: str) -> str:
+    """An explicitly requested ranking count, for cache-key separation.
+
+    A canonicalized ranking request may drop the requested count (the LLM
+    canonicalizer's ranking template carries no N slot), so two requests
+    that differ only in N would otherwise collide on one cache slot.  The
+    analytical-shape layer reads the count from the ORIGINAL question, so
+    the cache key must carry it too.  Returns '' when no explicit count is
+    present, so default-limit requests keep sharing one slot.
+    """
+    q = question.lower()
+    m = re.search(r"\btop\s+(\d{1,3})\b", q) or re.search(
+        r"\b(?:show|list|give me)\s+(?:the\s+)?(\d{1,3})\b", q
+    )
+    if m:
+        return f"top {int(m.group(1))}"
+    words = r"(?:one|two|three|four|five|six|seven|eight|nine|ten)"
+    m = re.search(rf"\btop\s+({words})\b", q) or re.search(
+        rf"\b(?:show|list|give me)\s+(?:the\s+)?({words})\b", q
+    )
+    if m:
+        return f"top {m.group(1)}"
+    return ""
+
+
+def _temporal_span(question: str) -> str:
+    """The explicit temporal span a request fixes, for cache-key separation.
+
+    The LLM canonicalizer drops temporal bounds in most phrasings
+    ("Activity events in 2025" -> "show number of activity_user_id over
+    time"), so two requests that differ only in their time span would
+    otherwise collide on one cache slot.  The span is read from the
+    ORIGINAL question, which is authoritative.  Returns '' when no
+    explicit span is present, so unbounded requests keep sharing one slot.
+    """
+    date = (r"(?:\d{4}-\d{2}-\d{2}"
+            r"|(?:\d{1,2}\s+)?[A-Za-z]+\s+\d{4}"
+            r"|[A-Za-z]+\s+\d{1,2},?\s+\d{4}"
+            r"|(?:19|20)\d{2})")
+    q = question.lower()
+    m = re.search(rf"\bfrom\s+({date})\s+(?:through|to|until)\s+({date})", q)
+    if m:
+        return f"{m.group(1)}..{m.group(2)}"
+    m = re.search(rf"\b(?:since|on or after|after)\s+({date})(?:\s+onward)?", q)
+    if m:
+        return f"{m.group(1)}.."
+    m = re.search(rf"\b(?:for|in|during|year)\s+({date})\b", q)
+    if m:
+        return m.group(1)
+    # LANGUAGE-NEUTRAL FALLBACK: no English marker, but the original question
+    # carries an explicit date/year token.  Fold that token into the key so
+    # differently-bounded requests (any language) do not collide on one slot.
+    m = re.search(rf"\b({date})\b", q)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _cache_key(question: str, original_question: str | None = None) -> str:
+    key = _normalize_question(question)
+    if original_question:
+        topn = _explicit_top_n(original_question)
+        if topn and topn not in key:
+            key = f"{key} {topn}"
+        span = _temporal_span(original_question)
+        if span and span not in key:
+            key = f"{key} {span}"
+    return key
 
 
 def _semantic_terms(question: str) -> set[str]:

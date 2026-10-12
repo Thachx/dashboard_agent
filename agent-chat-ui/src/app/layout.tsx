@@ -11,7 +11,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Dashboard Graph Agent",
+  title: "แดชบอร์ดกราฟเอเจนท์",
   description: "Chat with S3 JSON data and graph dashboard widgets",
 };
 
@@ -21,7 +21,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="th">
       <body className={inter.className} suppressHydrationWarning>
         <NuqsAdapter>{children}</NuqsAdapter>
       </body>

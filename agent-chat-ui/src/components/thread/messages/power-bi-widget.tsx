@@ -1,15 +1,22 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
+  AreaChart as AreaChartIcon,
   BarChart3,
+  BarChartHorizontal,
   BookOpen,
   ChevronDown,
+  ChevronUp,
   Clock,
   Database,
+  Gauge,
+  LineChart as LineChartIcon,
   ListChecks,
   MousePointerClick,
+  PieChart as PieChartIcon,
+  Radar as RadarIcon,
   X,
   Users,
 } from "lucide-react";
@@ -75,7 +82,7 @@ const THAI_SOURCE_LABELS: Record<string, string> = {
   "Derived table": "ตารางที่ประมวลผลแล้ว",
   "Object type": "ชนิดข้อมูล",
   "Rows used": "จำนวนแถวที่ใช้",
-  Coverage: "ขอบเขตข้อมูล",
+  "Coverage": "ขอบเขตข้อมูล",
   Fields: "ฟิลด์ข้อมูล",
   "Query plan": "แผนการสืบค้น",
   Source: "แหล่งข้อมูล",
@@ -704,7 +711,7 @@ function BreakdownList({
         {title}
       </p>
       <div className="mt-3 space-y-3">
-        {data.slice(0, 6).map((item) => {
+        {data.map((item) => {
           const value = Number(item.value ?? item.score ?? 0);
           return (
             <div key={`${title}-${item.label}`}>
@@ -757,7 +764,6 @@ function MetricCard({
 
 function DonutChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
   const chartData = data
-    .slice(0, 6)
     .map((item) => ({ name: item.label, value: Number(item.value ?? item.score ?? 0) }))
     .filter((item) => item.value > 0);
   const total = chartData.reduce((sum, item) => sum + item.value, 0);
@@ -790,7 +796,7 @@ function DonutChartCard({ data, title }: { data: ChartDatum[]; title: string }) 
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
             <div className="text-center">
               <p className="text-lg font-semibold">{formatNumber(total)}</p>
-              <p className="text-[10px] text-muted-foreground">records</p>
+              <p className="text-[11px] text-foreground/70">records</p>
             </div>
           </div>
         </div>
@@ -814,7 +820,7 @@ function DonutChartCard({ data, title }: { data: ChartDatum[]; title: string }) 
 }
 
 function MiniColumnChart({ data, title }: { data: ChartDatum[]; title: string }) {
-  const chartData = data.slice(0, 6).map((item) => ({
+  const chartData = data.map((item) => ({
     label: humanLabel(item.label),
     value: Number(item.value ?? item.score ?? 0),
   }));
@@ -888,7 +894,7 @@ function RadarChartCard({ data, title }: { data: ChartDatum[]; title: string }) 
 }
 
 function RadialBarChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
-  const chartData = data.slice(0, 6).map((item, index) => ({
+  const chartData = data.map((item, index) => ({
     name: humanLabel(item.label),
     value: Number(item.value ?? item.score ?? 0),
     fill: CHART_COLORS[index % CHART_COLORS.length],
@@ -1141,13 +1147,47 @@ function AreaChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
 function TreemapChartCard({ data, title }: { data: ChartDatum[]; title: string }) {
   const chartData = data
     .slice(0, 12)
-    .map((item) => ({
+    .map((item, index) => ({
       name: humanLabel(item.label),
       rawLabel: item.label,
       value: Number(item.value ?? item.score ?? 0),
+      fill: CHART_COLORS[index % CHART_COLORS.length],
     }))
     .filter((item) => item.value > 0);
   if (!chartData.length) return null;
+
+  const TreemapCell = (props: any) => {
+    const { x, y, width, height, index } = props;
+    const item = chartData[index];
+    if (!item || width <= 0 || height <= 0) return null;
+    const showLabel = width > 54 && height > 24;
+    const showValue = width > 46 && height > 38;
+    const label = compactLabel(item.name);
+    return (
+      <g>
+        <rect
+          x={x + 0.5}
+          y={y + 0.5}
+          width={Math.max(0, width - 1)}
+          height={Math.max(0, height - 1)}
+          fill={item.fill}
+          stroke="#ffffff"
+          strokeWidth={1}
+          rx={2}
+        />
+        {showLabel ? (
+          <text x={x + 6} y={y + 14} fontSize={10} fontWeight={600} fill="#ffffff" pointerEvents="none">
+            {label}
+          </text>
+        ) : null}
+        {showValue ? (
+          <text x={x + 6} y={y + (showLabel ? 28 : 14)} fontSize={10} fill="#ffffff" opacity={0.9} pointerEvents="none">
+            {formatNumber(item.value)}
+          </text>
+        ) : null}
+      </g>
+    );
+  };
 
   return (
     <div className="rounded-lg border bg-muted/10 p-3">
@@ -1161,8 +1201,8 @@ function TreemapChartCard({ data, title }: { data: ChartDatum[]; title: string }
             dataKey="value"
             nameKey="name"
             stroke="#ffffff"
-            fill="#2563eb"
             isAnimationActive={false}
+            content={<TreemapCell />}
           >
             <Tooltip
               formatter={(value) => formatNumber(value)}
@@ -1199,7 +1239,184 @@ function StatSlotCard({
   );
 }
 
-function ChartSlotCard({
+type ChartTypeOption = {
+  value: string;
+  label: string;
+  icon: typeof BarChart3;
+  family: string;
+  requiresSeries?: boolean;
+};
+
+const CHART_TYPE_FAMILIES: Record<string, string> = {
+  stacked_column: "bar",
+  stacked_bar: "bar",
+  column: "bar",
+  bar: "bar",
+  horizontal_bar: "bar",
+  radial_bar: "bar",
+  multi_line: "line",
+  line: "line",
+  area: "line",
+  donut: "pie",
+  pie: "pie",
+  radar: "radar",
+  funnel: "funnel",
+  stat: "stat",
+  treemap: "treemap",
+  list: "list",
+};
+
+function chartTypeFamily(type: string) {
+  return CHART_TYPE_FAMILIES[type] ?? "bar";
+}
+
+// Mirror ChartCardInner's dispatch so the picker reflects what the chart
+// actually renders (e.g. "bar"/"horizontal_bar"/unknown render as a list).
+function effectiveChartType(data: ChartDatum[], chartType: string) {
+  const hasSeries = data.some((item) => item.series);
+  if (chartType === "multi_line") return "multi_line";
+  if (chartType === "stacked_column") return "stacked_column";
+  if (hasSeries) return "stacked_bar";
+  if (chartType === "line") return "line";
+  if (chartType === "area") return "area";
+  if (chartType === "stat") return "stat";
+  if (chartType === "donut") return "donut";
+  if (chartType === "pie") return "pie";
+  if (chartType === "radar") return "radar";
+  if (chartType === "radial_bar") return "radial_bar";
+  if (chartType === "funnel") return "funnel";
+  if (chartType === "column") return "column";
+  if (chartType === "stacked_bar") return "stacked_bar";
+  if (chartType === "treemap") return "treemap";
+  return "list";
+}
+
+function chartTypeOptions(
+  data: ChartDatum[],
+  currentType: string,
+  isThai: boolean,
+): ChartTypeOption[] {
+  const hasSeries = data.some((item) => item.series);
+  const family = chartTypeFamily(currentType);
+  const en = (v: string, t: string, e: string) => (isThai ? t : e);
+  const all: ChartTypeOption[] = [
+    { value: "stacked_column", label: en("stacked_column", "คอลัมน์ซ้อน", "Stacked column"), icon: BarChart3, family: "bar", requiresSeries: true },
+    { value: "stacked_bar", label: en("stacked_bar", "แท่งซ้อน", "Stacked bar"), icon: BarChartHorizontal, family: "bar", requiresSeries: true },
+    { value: "column", label: en("column", "คอลัมน์", "Column"), icon: BarChart3, family: "bar" },
+    { value: "radial_bar", label: en("radial_bar", "กึ่งวงกลม", "Radial bar"), icon: Gauge, family: "bar" },
+    { value: "multi_line", label: en("multi_line", "เส้นหลายชุด", "Multi-line"), icon: LineChartIcon, family: "line", requiresSeries: true },
+    { value: "line", label: en("line", "เส้น", "Line"), icon: LineChartIcon, family: "line" },
+    { value: "area", label: en("area", "พื้นที่", "Area"), icon: AreaChartIcon, family: "line" },
+    { value: "donut", label: en("donut", "โดนัท", "Donut"), icon: PieChartIcon, family: "pie" },
+    { value: "pie", label: en("pie", "พาย", "Pie"), icon: PieChartIcon, family: "pie" },
+    { value: "radar", label: en("radar", "เรดาร์", "Radar"), icon: RadarIcon, family: "radar" },
+    { value: "funnel", label: en("funnel", "ฟั่นเนล", "Funnel"), icon: Gauge, family: "funnel" },
+    { value: "stat", label: en("stat", "สถิติน", "Stat"), icon: Gauge, family: "stat" },
+    { value: "treemap", label: en("treemap", "ทรีแมป", "Treemap"), icon: BarChart3, family: "treemap" },
+    { value: "list", label: en("list", "รายการ", "List"), icon: ListChecks, family: "list" },
+  ];
+  const familyOpts = all.filter(
+    (option) => option.family === family && (!option.requiresSeries || hasSeries),
+  );
+  // Always allow switching to a list representation, even when the chart's
+  // natural family has no list member (e.g. a bar chart rendered as a list).
+  const listOption = all.find((option) => option.value === "list");
+  if (listOption && !familyOpts.some((option) => option.value === "list")) {
+    familyOpts.push(listOption);
+  }
+  return familyOpts;
+}
+
+function ChartTypePicker({
+  data,
+  value,
+  onSelect,
+  isThai,
+}: {
+  data: ChartDatum[];
+  value: string;
+  onSelect: (value: string) => void;
+  isThai: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const effectiveType = effectiveChartType(data, value);
+  // Offer options from the chart's natural family (raw type) so a bar chart
+  // rendered as a list can still switch to Column/Radial bar; the label and
+  // active highlight reflect what is actually rendered (effectiveType).
+  const options = chartTypeOptions(data, value, isThai);
+  const known = options.find((o) => o.value === effectiveType);
+  const current = known ?? { value: effectiveType, label: isThai ? "กราฟ" : "Chart", icon: BarChart3, family: "bar" };
+  const CurrentIcon = current.icon;
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    const onClick = (event: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onClick);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={isThai ? "เปลี่ยนประเภทกราฟ" : "Change chart type"}
+        aria-label={isThai ? "เปลี่ยนประเภทกราฟ" : "Change chart type"}
+        aria-expanded={open}
+        className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition ${
+          open
+            ? "border-foreground/30 bg-muted text-foreground"
+            : "border-border bg-background text-foreground/80 hover:bg-muted hover:text-foreground"
+        }`}
+      >
+        <CurrentIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        <span className="max-w-24 truncate">{current.label}</span>
+        <ChevronDown
+          className={`h-3 w-3 transition-transform duration-200 ${open ? "rotate-180" : ""}`}
+          aria-hidden="true"
+        />
+      </button>
+      {open ? (
+        <div className="chart-dropdown absolute right-0 z-20 mt-1 max-h-52 w-44 overflow-y-auto overscroll-contain rounded-lg border bg-background p-1 shadow-lg">
+          {options.map((option) => {
+            const OptionIcon = option.icon;
+            const active = option.value === effectiveType;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                onClick={() => {
+                  onSelect(option.value);
+                  setOpen(false);
+                }}
+                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition ${
+                  active ? "bg-muted font-medium text-foreground" : "text-foreground/80 hover:bg-muted/60"
+                }`}
+              >
+                <OptionIcon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                <span className="truncate">{option.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ChartCardInner({
   slot,
 }: {
   slot: {
@@ -1207,6 +1424,7 @@ function ChartSlotCard({
     title: string;
     chartType: string;
     field: string;
+    description?: string;
     reason?: string;
     data: ChartDatum[];
   };
@@ -1255,6 +1473,79 @@ function ChartSlotCard({
     return <TreemapChartCard data={slot.data} title={slot.title} />;
   }
   return <BreakdownList data={slot.data} title={slot.title} kind={kind} />;
+}
+
+function ChartSlotCard({
+  slot,
+  language,
+}: {
+  slot: {
+    id: string;
+    title: string;
+    chartType: string;
+    field: string;
+    description?: string;
+    reason?: string;
+    data: ChartDatum[];
+  };
+  language: string;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const [typeOverride, setTypeOverride] = useState<string | null>(null);
+  const isThai = language === "th";
+  const effectiveType = typeOverride ?? slot.chartType;
+  const allData = slot.data || [];
+  const hasMoreRows = allData.length > 10;
+  const visibleSlot = showAll || !hasMoreRows
+    ? { ...slot, chartType: effectiveType }
+    : { ...slot, chartType: effectiveType, data: allData.slice(0, 10) };
+  return (
+    <div className="flex h-full min-w-0 flex-col gap-1.5">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        {slot.field ? (
+          <p
+            className="min-w-0 truncate text-[11px] text-muted-foreground"
+            title={slot.description ?? slot.field}
+          >
+            <span className="font-medium text-foreground/60">
+              {humanLabel(slot.field)}
+            </span>
+            {slot.description ? ` \u00b7 ${slot.description}` : null}
+          </p>
+        ) : (
+          <span className="min-w-0" />
+        )}
+        <ChartTypePicker
+          data={slot.data}
+          value={effectiveType}
+          onSelect={setTypeOverride}
+          isThai={isThai}
+        />
+      </div>
+      <div className="relative min-h-0 flex-1">
+        <div key={effectiveType} className="chart-fade h-full [&>*]:h-full">
+          <ChartCardInner slot={visibleSlot} />
+        </div>
+      </div>
+      {hasMoreRows ? (
+      <div className="flex items-center justify-between gap-2 border-t border-border bg-muted/10 px-2 py-1">
+        <span className="min-w-0 truncate text-[10px] text-muted-foreground">
+          {isThai ? (showAll ? "แสดงแถวทั้งหมด" : "กำล้งแสดง 10 แถวแรก") : (showAll ? "Showing all rows" : "Showing top 10 rows")}
+        </span>
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          title={isThai ? (showAll ? "แสดงแถวให้น้อยลง" : "แสดงทุกแถว") : (showAll ? "Show fewer rows" : "Show all rows")}
+          aria-label={isThai ? "ขยายหรือย้บรายการ" : "Expand or collapse chart"}
+          className="flex shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground/80 transition hover:bg-muted hover:text-foreground"
+        >
+          {showAll ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          <span>{isThai ? (showAll ? "แสดงแถวให้น้อยลง" : "แสดงทุกแถว") : (showAll ? "Show fewer" : "Show all")}</span>
+        </button>
+      </div>
+      ) : null}
+    </div>
+  );
 }
 
 function chartUsesFullRow(slot: ChartSlot, requestedSpan?: number) {
@@ -1502,44 +1793,46 @@ function PromptDashboardSection({ activity }: { activity?: ActivityDashboardPayl
               : "grid gap-3"
           }
         >
-        {metricBlocks.length ? (
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-1">
-            {metricBlocks.map((block, index) => {
-              if (block.type !== "metric") return null;
-              const metric = metricDefs[block.id];
-              if (!metric || metric.value == null) return null;
-              return (
-                <div
-                  key={`${block.type}-${block.id}-${index}`}
-                  className="min-w-0"
-                >
-                  <MetricCard
-                    label={metric.label}
-                    value={metric.value}
-                    hint={metric.hint}
-                    icon={metric.icon}
-                  />
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
+          {metricBlocks.length ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-1">
+              {metricBlocks.map((block, index) => {
+                if (block.type !== "metric") return null;
+                const metric = metricDefs[block.id];
+                if (!metric || metric.value == null) return null;
+                return (
+                  <div
+                    key={`${block.type}-${block.id}-${index}`}
+                    className="chart-card-in min-w-0"
+                    style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
+                  >
+                    <MetricCard
+                      label={metric.label}
+                      value={metric.value}
+                      hint={metric.hint}
+                      icon={metric.icon}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
 
-        {visibleCharts.length ? (
-          <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-            {visibleCharts.map(({ block, index, slot }, visibleIndex) => {
-              const span = visibleChartSpans[visibleIndex] ?? 12;
-              return (
-                <div
-                  key={`${block.type}-${block.slotId}-${index}`}
-                  className={`h-full min-w-0 [&>*]:h-full ${chartSpanClass(span)}`}
-                >
-                  <ChartSlotCard slot={slot} />
-                </div>
-              );
-            })}
-          </div>
-        ) : null}
+          {visibleCharts.length ? (
+            <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
+              {visibleCharts.map(({ block, index, slot }, visibleIndex) => {
+                const span = visibleChartSpans[visibleIndex] ?? 12;
+                return (
+                  <div
+                    key={`${block.type}-${block.slotId}-${index}`}
+                    className={`chart-card-in h-full min-w-0 [&>*]:h-full ${chartSpanClass(span)}`}
+                    style={{ animationDelay: `${Math.min(visibleIndex, 8) * 45}ms` }}
+                  >
+                    <ChartSlotCard slot={slot} language={language} />
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
 
         {recordBlocks.map((block, index) =>
@@ -1689,7 +1982,7 @@ function ActivityDashboardSection({ activity }: { activity?: ActivityDashboardPa
         {chartSlots
           .filter((slot) => slot.data?.length)
           .map((slot) => (
-            <ChartSlotCard key={slot.id} slot={slot} />
+            <ChartSlotCard key={slot.id} slot={slot} language={language} />
           ))}
       </div>
 
@@ -1813,6 +2106,7 @@ export function PowerBiWidget({
           <SourceDisclosure items={graphSourceItems(payload)} />
         </header>
       ) : null}
+
 
       <PromptDashboardSection activity={activity} />
 
