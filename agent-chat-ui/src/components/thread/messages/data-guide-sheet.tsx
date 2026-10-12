@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
+  ChevronDown,
   Fingerprint,
-  Hash,
   MessageSquareText,
   Search,
   Timer,
@@ -83,6 +83,19 @@ function shortSourcePath(p: string): string {
 }
 
 
+// Color a type badge by data-type family so the eye can scan quickly.
+function typeBadgeClasses(dataType: string): string {
+  const dt = dataType.toUpperCase();
+  if (/(BIGINT|INT|DOUBLE|FLOAT|DECIMAL|NUMERIC|REAL|SMALLINT|TINYINT|HUGEINT)/.test(dt))
+    return "border-blue-200 bg-blue-50 text-blue-700";
+  if (/BOOLEAN/.test(dt)) return "border-amber-200 bg-amber-50 text-amber-700";
+  if (/(TIMESTAMP|DATE|TIME)/.test(dt)) return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (/(VARCHAR|TEXT|STRING|CHAR|JSON|BLOB|BYTEA)/.test(dt))
+    return "border-violet-200 bg-violet-50 text-violet-700";
+  return "border-border bg-muted text-foreground/70";
+}
+
+
 function describeField(col: GuideColumn, tableName: string): string {
   const dt = col.dataType.toUpperCase();
   let role: string;
@@ -111,6 +124,16 @@ export function DataGuideSheet() {
   const [payload, setPayload] = useState<GuidePayload | null>(null);
   const [failed, setFailed] = useState(false);
   const [query, setQuery] = useState("");
+  // Tables are expanded by default; the set tracks explicit collapses.
+  const [collapsedTables, setCollapsedTables] = useState<Set<string>>(new Set());
+  const isTableExpanded = (name: string) => !collapsedTables.has(name);
+  const toggleTable = (name: string) =>
+    setCollapsedTables((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
 
   useEffect(() => {
     if (!open || payload || failed) return;
@@ -210,9 +233,9 @@ export function DataGuideSheet() {
         </SheetHeader>
 
         {payload?.thaiOverview ? (
-          <div className="rounded-lg border bg-muted/20 px-3 py-2">
-            <p className="text-xs font-semibold">เกี่ยวกับข้อมูลนี้</p>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{payload?.thaiOverview}</p>
+          <div className="rounded-lg border border-l-4 border-border border-l-blue-500 bg-muted/20 px-3 py-2">
+            <p className="text-xs font-semibold text-foreground/80">เกี่ยวกับข้อมูลนี้</p>
+            <p className="mt-1 text-xs leading-relaxed text-foreground/70">{payload?.thaiOverview}</p>
           </div>
         ) : null}
 
@@ -252,31 +275,47 @@ export function DataGuideSheet() {
               {filteredTables.map(({table, cols}) => (
                 <section key={table.name} className="space-y-2">
                   <div className="px-1">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold">
+                    <button
+                      type="button"
+                      onClick={() => toggleTable(table.name)}
+                      className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left transition hover:bg-muted/40"
+                      aria-expanded={isTableExpanded(table.name)}
+                    >
+                      <ChevronDown
+                        className={
+                          "h-4 w-4 shrink-0 text-muted-foreground transition-transform " +
+                          (isTableExpanded(table.name) ? "" : "-rotate-90")
+                        }
+                        aria-hidden="true"
+                      />
+                      <h3 className="min-w-0 flex-1 truncate text-sm font-semibold">
                         {table.isSource && table.sourceLabel
                           ? table.sourceLabel
                           : humanizeField(table.name)}
                       </h3>
-                      {table.isSource ? (
-                        <span className="shrink-0 rounded border border-foreground/20 bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      <span className="shrink-0 rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-foreground/70">
+                        {table.rowCount.toLocaleString()} แถว
+                      </span>
+                      {table.isSource && table.sourceSystem ? (
+                        <span className="shrink-0 rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700">
                           {table.sourceSystem}
                         </span>
                       ) : null}
-                    </div>
-                    <p className="mt-0.5 text-xs text-muted-foreground">
+                    </button>
+                    <p className="mt-0.5 pl-6 text-xs text-foreground/70">
                       {table.thaiSummary ||
                         `${table.rowCount.toLocaleString()} แถว`}
                     </p>
                     {!table.isSource && table.sourcePaths.length ? (
                       <p
-                        className="mt-0.5 truncate text-[11px] text-muted-foreground/70"
+                        className="mt-0.5 truncate pl-6 text-[11px] text-foreground/60"
                         title={table.sourcePaths.join(", ")}
                       >
                         {table.sourcePaths.map(shortSourcePath).join(", ")}
                       </p>
                     ) : null}
                   </div>
+                  {isTableExpanded(table.name) ? (
                   <div className="space-y-2">
                     {cols.map((col) => (
                       <div
@@ -302,18 +341,20 @@ export function DataGuideSheet() {
                             ) : null}
                           </div>
                           <span
-                            className="flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                            className={
+                              "flex shrink-0 items-center rounded border px-1.5 py-0.5 text-[10px] font-medium " +
+                              typeBadgeClasses(col.dataType)
+                            }
                             title={col.dataType}
                           >
-                            <Hash className="h-3 w-3" aria-hidden="true" />
                             {col.dataType}
                           </span>
                         </div>
-                        <p className="mt-1 text-xs text-muted-foreground">
+                        <p className="mt-1 text-xs leading-relaxed text-foreground/75">
                           {col.thaiDescription || describeField(col, table.name)}
                         </p>
                         {col.samples.length ? (
-                          <p className="mt-1 text-xs text-muted-foreground/80">
+                          <p className="mt-1 text-xs text-foreground/60">
                             เช่น {col.samples.slice(0, 3).join(", ")}
                           </p>
                         ) : null}
@@ -327,7 +368,7 @@ export function DataGuideSheet() {
                             );
                             setOpen(false);
                           }}
-                          className="mt-2 inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs font-medium text-foreground/70 transition hover:border-foreground/30 hover:text-foreground"
+                          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white shadow-xs transition hover:bg-blue-700"
                         >
                           <MessageSquareText className="h-3.5 w-3.5" aria-hidden="true" />
                           ถามเกี่ยวกับฟิลด์นี้
@@ -335,6 +376,7 @@ export function DataGuideSheet() {
                       </div>
                     ))}
                   </div>
+                  ) : null}
                 </section>
               ))}
             </div>
