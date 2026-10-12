@@ -1,0 +1,49 @@
+{
+  "name": "dashboard-agent-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP Apps server and embedded dashboard UI for Dashboard Graph Agent",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names server,ui \"npm:dev:server\" \"npm:dev:ui\"",
+    "dev:server": "tsx watch src/server/main.ts",
+    "dev:ui": "vite --host 0.0.0.0 --port 5173",
+    "build": "npm run typecheck && npm run build:server && npm run build:ui",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:ui": "cross-env INPUT=dashboard-app.html vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/server/server/main.js",
+    "start:stdio": "node dist/server/server/main.js --stdio"
+  },
+  "dependencies": {
+    "@expo-google-fonts/sarabun": "^0.4.1",
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/canvas": "^1.0.3",
+    "@resvg/resvg-js": "^2.6.2",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "recharts": "^3.6.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7",
+    "vite-plugin-singlefile": "^2.3.0",
+    "vitest": "^4.0.16"
+  }
+}
