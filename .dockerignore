@@ -1,0 +1,38 @@
+# Build context is the repo root (all Dockerfiles use context: ..).
+# Keep the context tiny: exclude data, venvs, node_modules, state, secrets.
+
+# Data & warehouses (tens of GB; bind-mounted at runtime)
+data/
+tmp/
+backend/data/
+*.duckdb
+*.duckdb.wal
+*.duckdb.bak_*
+
+# Python virtualenvs & langgraph state
+backend/.venv/
+backend/.langgraph_api/
+backend/.langgraph_api_backup_*/
+langgraph.log
+langgraph-*.log
+
+# Node
+agent-chat-ui/node_modules/
+agent-chat-ui/.next/
+agent-chat-ui/tsconfig.tsbuildinfo
+mcp/node_modules/
+mcp/dist/
+mcp/data/
+
+# Secrets & env files (never bake into images)
+**/.env
+**/.env.local
+**/.env.bak*
+**/.env.pre-*
+backend/.env
+
+# Backups & VCS
+**/*.bak_*
+**/*.bak-*
+.git/
+.agents/

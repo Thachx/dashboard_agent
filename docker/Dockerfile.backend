@@ -1,0 +1,39 @@
+# Dashboard Agent backend — LangGraph agent (port 2024)
+#
+# Build:  docker build -f docker/Dockerfile.backend -t dashboard-agent-backend .
+# Run:    see docker/docker-compose.yml (bind-mounts .env, data/, .langgraph_api/, ~/.aws)
+#
+# The container runs as uid 1006 to match the host user (thacha) so the
+# bind-mounted data, langgraph state, and AWS credentials are readable.
+FROM python:3.12-slim
+
+# DuckDB / graphify pull native libs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps from the pinned manifest first (cached layer).
+COPY backend/pyproject.toml ./pyproject.toml
+RUN pip install --no-cache-dir "setuptools>=68" \
+    && pip install --no-cache-dir \
+       "boto3>=1.34.0" "duckdb>=1.0.0" "pytz>=2024.1" "langchain-core>=0.3.0" \
+       "langchain-openai>=0.2.0" "langgraph>=0.2.60" "langgraph-cli[inmem]>=0.4.0" \
+       "networkx>=3.3" "graphifyy>=0.8.46"
+
+# Application source + entrypoint config.
+COPY backend/src ./src
+COPY backend/langgraph.json ./langgraph.json
+COPY backend/run_s3_duckdb_pipeline.py ./run_s3_duckdb_pipeline.py
+ENV PYTHONPATH=/app/src
+
+# Host-uid user so bind mounts (data/, .langgraph_api/, ~/.aws) are readable.
+RUN useradd -u 1006 -m -d /home/agent agent \
+    && mkdir -p /app/data /app/.langgraph_api && chown -R 1006:1006 /app
+USER 1006
+
+EXPOSE 2024
+
+# Same serve entrypoint used in production. --no-reload: single process.
+CMD ["langgraph", "dev", "--port", "2024", "--no-browser", "--no-reload", "--n-jobs-per-worker", "50"]

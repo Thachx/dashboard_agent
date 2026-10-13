@@ -1,0 +1,170 @@
+# Dashboard Agent — full stack as Docker services.
+#
+# Brings up everything the host systemd units run, with `restart:
+# unless-stopped` so the whole stack survives reboots (24/7):
+#
+#   backend   langgraph agent API            :2024
+#   catalog   read-only warehouse schema API :8090
+#   ui        Next.js web UI (ask.lead.in.th):3000
+#   mcp       MCP Apps server                :3001
+#   ingest    hourly S3 -> DuckDB pipeline   (scheduler, replaces the systemd timer)
+#
+# The GPT-OSS SSH tunnel (gptoss-tunnel.service) is intentionally NOT a
+# container: it needs a private SSH key and a private-network target. Keep
+# it running on the host (systemd) and point the backend at it via
+# GPTOSS_BASE_URL (default below is the host's localhost tunnel port).
+#
+# Usage (from the repo root):
+#   docker compose -f docker/docker-compose.yml up -d --build
+#   docker compose -f docker/docker-compose.yml ps
+#
+# Bind mounts (host paths are relative to the repo root):
+#   backend/.env                -> container env (S3/LLM keys)
+#   data/_warehouse/            -> 66GB DuckDB warehouse + graph JSON (shared by backend/catalog/ingest)
+#   backend/.langgraph_api/     -> langgraph in-memory store (446M, persists threads)
+#   ~/.aws/                     -> AWS credentials for S3 ingestion
+#   mcp/data/previews/          -> MCP preview PNGs
+#
+# NOTE: the 66GB warehouse is bind-mounted, not copied — first `up` is fast.
+
+x-host-uid: &host-uid "1006"   # thacha's uid; keep in sync with the Dockerfiles
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    image: dashboard-agent-backend
+    container_name: dashboard-agent-backend
+    user: "${HOST_UID:-1006}"
+    env_file:
+      - ../backend/.env
+    environment:
+      # Absolute container paths for the bind-mounted data.
+      GRAPH_PATH: /app/data/_warehouse/duckdb-graph.json
+      DUCKDB_PATH: /app/data/_warehouse/dashboard_agent.duckdb
+      # GPT-OSS tunnel runs on the host; reach it via the docker bridge gateway.
+      GPTOSS_BASE_URL: ${GPTOSS_BASE_URL:-http://host.docker.internal:18080/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../data/_warehouse:/app/data/_warehouse
+      - ../backend/.langgraph_api:/app/.langgraph_api
+      - ~/.aws:/home/agent/.aws:ro
+    ports:
+      - "127.0.0.1:2024:2024"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:2024/ok', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging: &default-logging
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+  catalog:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.catalog
+    image: dashboard-agent-catalog
+    container_name: dashboard-agent-catalog
+    user: "${HOST_UID:-1006}"
+    env_file:
+      - ../backend/.env
+    environment:
+      DASHBOARD_WAREHOUSE_PATH: /app/data/_warehouse/dashboard_agent.duckdb
+    volumes:
+      - ../data/_warehouse:/app/data/_warehouse:ro
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+
+  ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ui
+      args:
+        NEXT_PUBLIC_ASSISTANT_ID: dashboard_agent
+        NEXT_PUBLIC_API_URL: /api
+    image: dashboard-agent-ui
+    container_name: dashboard-agent-ui
+    user: "${HOST_UID:-1006}"
+    environment:
+      LANGGRAPH_API_URL: http://backend:2024
+      CATALOG_API_URL: http://catalog:8090
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+      - catalog
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  mcp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mcp
+    image: dashboard-agent-mcp
+    container_name: dashboard-agent-mcp
+    user: "${HOST_UID:-1006}"
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "3001"
+      # Browser-reachable base URL for Markdown image results. Override for
+      # public exposure, e.g. https://mcp.lead.in.th
+      MCP_PUBLIC_BASE_URL: ${MCP_PUBLIC_BASE_URL:-http://localhost:3001}
+      DASHBOARD_AGENT_URL: http://backend:2024
+      DASHBOARD_AGENT_ASSISTANT_ID: dashboard_agent
+      DASHBOARD_PREVIEW_DIR: /app/data/previews
+    volumes:
+      - ../mcp/data/previews:/app/data/previews
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+
+  ingest:
+    # Same image as the backend (it runs run_s3_duckdb_pipeline.py); the
+    # scheduler script replaces the host systemd timer (hourly at :25).
+    image: dashboard-agent-backend
+    container_name: dashboard-agent-ingest
+    user: "${HOST_UID:-1006}"
+    env_file:
+      - ../backend/.env
+    environment:
+      GRAPH_PATH: /app/data/_warehouse/duckdb-graph.json
+      DUCKDB_PATH: /app/data/_warehouse/dashboard_agent.duckdb
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+    volumes:
+      - ../data/_warehouse:/app/data/_warehouse
+      - ~/.aws:/home/agent/.aws:ro
+    depends_on:
+      - backend
+    command: ["python", "docker/ingest_scheduler.py"]
+    restart: unless-stopped
+    logging: *default-logging

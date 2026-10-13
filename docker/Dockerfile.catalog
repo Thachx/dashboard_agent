@@ -1,0 +1,30 @@
+# Dashboard Agent catalog API (port 8090) — read-only warehouse schema guide.
+# Shares the backend image; only the entrypoint differs.
+#
+# Build:  docker build -f docker/Dockerfile.catalog -t dashboard-agent-catalog .
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backend/pyproject.toml ./pyproject.toml
+RUN pip install --no-cache-dir "setuptools>=68" \
+    && pip install --no-cache-dir \
+       "boto3>=1.34.0" "duckdb>=1.0.0" "pytz>=2024.1" "langchain-core>=0.3.0" \
+       "langchain-openai>=0.2.0" "langgraph>=0.2.60" "langgraph-cli[inmem]>=0.4.0" \
+       "networkx>=3.3" "graphifyy>=0.8.46" \
+    && pip install --no-cache-dir "fastapi" "uvicorn[standard]"
+
+COPY backend/src ./src
+ENV PYTHONPATH=/app/src
+
+RUN useradd -u 1006 -m -d /home/agent agent && chown -R 1006:1006 /app
+USER 1006
+
+EXPOSE 8090
+
+# Warehouse path is set via DASHBOARD_WAREHOUSE_PATH (bind-mounted data/).
+CMD ["uvicorn", "dashboard_agent.catalog_api:app", "--host", "0.0.0.0", "--port", "8090"]

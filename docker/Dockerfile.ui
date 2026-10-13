@@ -1,0 +1,31 @@
+# Dashboard Agent web UI — Next.js (port 3000)
+#
+# Build:  docker build -f docker/Dockerfile.ui -t dashboard-agent-ui .
+# Run:    see docker/docker-compose.yml
+#
+# NEXT_PUBLIC_* values are inlined at build time. Defaults match production:
+#   NEXT_PUBLIC_ASSISTANT_ID=dashboard_agent
+#   NEXT_PUBLIC_API_URL=/api   (same-origin; the UI proxies to langgraph)
+FROM node:20-bookworm-slim
+WORKDIR /app
+
+COPY agent-chat-ui/package.json agent-chat-ui/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# Copy the app (agent-chat-ui/.dockerignore excludes node_modules/.next/.env*).
+COPY agent-chat-ui/ ./
+
+ARG NEXT_PUBLIC_ASSISTANT_ID=dashboard_agent
+ARG NEXT_PUBLIC_API_URL=/api
+ENV NEXT_PUBLIC_ASSISTANT_ID=$NEXT_PUBLIC_ASSISTANT_ID \
+    NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+RUN useradd -u 1006 -m -d /home/agent agent && chown -R 1006:1006 /app
+USER 1006
+
+EXPOSE 3000
+# Runtime env (server-side): where the /api proxy forwards to.
+ENV LANGGRAPH_API_URL=http://backend:2024 CATALOG_API_URL=http://catalog:8090
+CMD ["npm", "run", "start", "--", "--hostname", "0.0.0.0"]

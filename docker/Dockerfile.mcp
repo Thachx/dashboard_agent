@@ -1,0 +1,25 @@
+# Dashboard Agent MCP server (port 3001)
+#
+# Build:  docker build -f docker/Dockerfile.mcp -t dashboard-agent-mcp .
+# Run:    see docker/docker-compose.yml (bind-mounts mcp/data for preview PNGs)
+FROM node:20-bookworm-slim
+WORKDIR /app
+
+COPY mcp/package.json mcp/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# Copy the app (mcp/.dockerignore excludes node_modules/dist).
+COPY mcp/ ./
+RUN npm run build
+
+RUN useradd -u 1006 -m -d /home/agent agent \
+    && mkdir -p /app/data/previews && chown -R 1006:1006 /app
+USER 1006
+
+EXPOSE 3001
+ENV MCP_HOST=0.0.0.0 \
+    MCP_PORT=3001 \
+    DASHBOARD_AGENT_URL=http://backend:2024 \
+    DASHBOARD_AGENT_ASSISTANT_ID=dashboard_agent \
+    DASHBOARD_PREVIEW_DIR=/app/data/previews
+CMD ["node", "dist/server/server/main.js"]
