@@ -28,7 +28,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent  # /app
 PIPELINE = ROOT / "run_s3_duckdb_pipeline.py"
-LAST_RUN_FILE = Path(os.environ.get("INGEST_STATE_FILE", "/app/data/ingest_last_run.txt"))
+LAST_RUN_FILE = Path(os.environ.get("INGEST_STATE_FILE", "/app/data/_warehouse/ingest_last_run.txt"))
 FIRE_MINUTE = int(os.environ.get("INGEST_FIRE_MINUTE", "25"))
 MAX_JITTER_SECONDS = int(os.environ.get("INGEST_MAX_JITTER_SECONDS", "120"))
 CATCHUP_MAX_AGE_MINUTES = int(os.environ.get("INGEST_CATCHUP_MAX_AGE_MINUTES", "75"))

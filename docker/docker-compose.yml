@@ -165,6 +165,6 @@ services:
       - ~/.aws:/home/agent/.aws:ro
     depends_on:
       - backend
-    command: ["python", "docker/ingest_scheduler.py"]
+    command: ["python", "/app/ingest_scheduler.py"]
     restart: unless-stopped
     logging: *default-logging
