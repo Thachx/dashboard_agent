@@ -1475,6 +1475,15 @@ function ChartCardInner({
   return <BreakdownList data={slot.data} title={slot.title} kind={kind} />;
 }
 
+function chartExpandsWithRows(data: ChartDatum[], chartType: string): boolean {
+  // Chart types whose rendered box grows with the number of rows: the stacked
+  // bar rows and the list view. Every other type plots inside a fixed-height
+  // box (line/area/multi-line h-56/h-64, column h-44, donut/pie/radar/radial,
+  // stat, funnel, treemap), so limiting rows or offering "show all" there is
+  // meaningless — the chart shows all rows either way.
+  const effective = effectiveChartType(data, chartType);
+  return effective === "stacked_bar" || effective === "list";
+}
 function ChartSlotCard({
   slot,
   language,
@@ -1495,7 +1504,12 @@ function ChartSlotCard({
   const isThai = language === "th";
   const effectiveType = typeOverride ?? slot.chartType;
   const allData = slot.data || [];
-  const hasMoreRows = allData.length > 10;
+  // Only charts whose box grows with the row count (stacked bar rows, list)
+  // get the 10-row limit + "show all" footer. Fixed-height charts (line,
+  // area, column, donut, ...) plot every row in a constant box, so the
+  // limit would just hide data for no visual benefit.
+  const limitable = chartExpandsWithRows(allData, effectiveType);
+  const hasMoreRows = limitable && allData.length > 10;
   const visibleSlot = showAll || !hasMoreRows
     ? { ...slot, chartType: effectiveType }
     : { ...slot, chartType: effectiveType, data: allData.slice(0, 10) };
