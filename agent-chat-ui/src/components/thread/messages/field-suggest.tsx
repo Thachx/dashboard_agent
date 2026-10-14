@@ -2,11 +2,19 @@
 // Field autosuggest for the chat composer.
 //
 // General, data-driven: it fetches the field catalog once, then matches the
-// user's ACTIVE TYPED TOKEN against every field's name, English terms, and Thai
-// description. It works for English ("grade", "user") and Thai ("คะแนน") alike
-// because the token is just the trailing run of word characters (ASCII or Thai
-// script) — no per-field or per-language hardcoding. Picking a field inserts its
-// readable name so the question names the field explicitly.
+// user's ACTIVE TYPED TOKEN against every field's name, English terms, and
+// Thai description. It works for English ("grade", "user") and Thai
+// ("คะแนน") alike because the token is just the trailing run of word
+// characters (ASCII or Thai script) — no per-field or per-language
+// hardcoding. Picking a field inserts its readable name so the question
+// names the field explicitly.
+//
+// Thai insertion is SURGICAL: Thai has no word boundaries, so the typed
+// token is a whole run ("แสดงคะแนนตามรายวิชา"). Matching reports the span of
+// the run that actually matched a field ("คะแนน"), and only that span is
+// replaced — the rest of the sentence is left untouched. English tokens are
+// single words, so their span is the whole token (unchanged behavior).
+// Matching is tone-mark-insensitive (see field-suggest-match.ts).
 import {
   useCallback,
   useEffect,
@@ -17,6 +25,12 @@ import {
 } from "react";
 import { Clock, Fingerprint } from "lucide-react";
 import { cn } from "@/lib/utils";
+import {
+  humanizeField,
+  scoreFieldWithSpan,
+  trailingToken,
+  type MatchSpan,
+} from "./field-suggest-match";
 
 type SuggestColumn = {
   name: string;
@@ -48,77 +62,11 @@ type Suggestion = {
   isIdentifier: boolean;
   thaiDescription: string;
   score: number;
+  span: MatchSpan; // part of the typed token this field matched
 };
 
 // House spelling (same codepoints as the data guide) for the panel header.
 const T_FIELD = "\u0e1f\u0e34\u0e25\u0e14\u0e4c"; // field
-
-function humanizeField(value: string): string {
-  return value
-    .replace(/[_-]+/g, " ")
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .trim();
-}
-
-// The trailing run of word characters (ASCII alnum/underscore or Thai block).
-// English: last space-delimited word. Thai: the whole typed run (no spaces).
-function trailingToken(text: string): { token: string; start: number } | null {
-  const m = text.match(/([A-Za-z0-9\u0e00-\u0e7f_]+)$/);
-  if (!m || m.index === undefined) return null;
-  return { token: m[1], start: m.index };
-}
-
-// Thai has no word boundaries, so a typed Thai token is a whole run and a plain
-// substring test misses ("แสดงคะแนน" does not contain the description, but
-// shares "คะแนน"). Longest-common-substring length is a language-neutral proxy
-// for how much of the typed Thai actually appears in the field's Thai label.
-function lcsLen(a: string, b: string): number {
-  if (!a.length || !b.length) return 0;
-  let prev = new Array(b.length + 1).fill(0);
-  let best = 0;
-  for (let i = 1; i <= a.length; i++) {
-    const cur = new Array(b.length + 1).fill(0);
-    for (let j = 1; j <= b.length; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        cur[j] = prev[j - 1] + 1;
-        if (cur[j] > best) best = cur[j];
-      }
-    }
-    prev = cur;
-  }
-  return best;
-}
-
-function isThai(s: string): boolean {
-  return /[\u0e00-\u0e7f]/.test(s);
-}
-
-function scoreField(col: SuggestColumn, token: string): number {
-  const t = token.toLowerCase();
-  const name = col.name.toLowerCase();
-  const human = humanizeField(col.name).toLowerCase();
-  const terms = (col.terms ?? []).map((x) => x.toLowerCase());
-  const thai = col.thaiDescription ?? "";
-  let score = 0;
-  if (name.startsWith(t)) score = Math.max(score, 100);
-  else if (name.includes(t)) score = Math.max(score, 70);
-  if (human.startsWith(t)) score = Math.max(score, 95);
-  else if (human.includes(t)) score = Math.max(score, 65);
-  for (const term of terms) {
-    if (term === t) score = Math.max(score, 90);
-    else if (term.startsWith(t)) score = Math.max(score, 80);
-    else if (term.includes(t)) score = Math.max(score, 60);
-  }
-  if (thai) {
-    if (isThai(token)) {
-      const shared = lcsLen(token, thai);
-      if (shared >= 3) score = Math.max(score, 55 + shared * 5);
-    } else if (thai.includes(token)) {
-      score = Math.max(score, 78);
-    }
-  }
-  return score;
-}
 
 function buildSuggestions(
   payload: SuggestPayload | null,
@@ -138,8 +86,8 @@ function buildSuggestions(
     for (const col of table.columns ?? []) {
       if (seen.has(col.name)) continue;
       seen.add(col.name);
-      const score = scoreField(col, token);
-      if (score <= 0) continue;
+      const { score, span } = scoreFieldWithSpan(col, token);
+      if (score <= 0 || !span) continue;
       out.push({
         key: `${table.name}.${col.name}`,
         field: col.name,
@@ -150,6 +98,7 @@ function buildSuggestions(
         isIdentifier: !!col.isIdentifier,
         thaiDescription: col.thaiDescription ?? "",
         score,
+        span,
       });
     }
   }
@@ -203,17 +152,20 @@ export function useFieldSuggest(opts: {
     (s: Suggestion) => {
       const info = trailingToken(input);
       if (!info) return;
-      const next =
-        input.slice(0, info.start) +
-        s.label +
-        " " +
-        input.slice(info.start + info.token.length);
+      // Replace only the matched span of the typed token, not the whole run:
+      // "แสดงคะแนนตามรายวิชา" + pick(คะแนน) -> "แสดง Grade ตามรายวิชา".
+      const absStart = info.start + s.span.start;
+      const absEnd = info.start + s.span.end;
+      const prefix = input.slice(0, absStart);
+      const suffix = input.slice(absEnd);
+      const needsSpace = suffix.length > 0 && !/^\s/.test(suffix);
+      const next = prefix + s.label + (needsSpace ? " " : "") + suffix;
       setInput(next);
       setDismissed(true);
       requestAnimationFrame(() => {
         const el = textareaRef.current;
         if (!el) return;
-        const pos = info.start + s.label.length + 1;
+        const pos = absStart + s.label.length + (needsSpace ? 1 : 0);
         el.focus();
         el.setSelectionRange(pos, pos);
       });
